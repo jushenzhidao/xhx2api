@@ -1,0 +1,119 @@
+{
+  "listen": "0.0.0.0:7867",
+  "api_key": "",
+  "auth_dir": "./auths",
+  "state_file": "./data/state.json",
+  "default_model": "raccoon-8c4485",
+  "aliases": {
+    "gpt-4o": "raccoon-chat-ml-5-5",
+    "gpt-4o-mini": "raccoon-chat-ml-5-5",
+    "gpt-4": "raccoon-8c4485",
+    "gpt-4.1": "raccoon-8c4485",
+    "gpt-4.1-mini": "raccoon-8c4485",
+    "gpt-5": "raccoon-8c4485",
+    "gpt-5-mini": "raccoon-8c4485",
+    "claude-sonnet-4-20250514": "raccoon-chat-ml-5-5",
+    "claude-3-5-sonnet-20241022": "raccoon-chat-ml-5-5",
+    "claude-3-7-sonnet-20250219": "raccoon-chat-ml-5-5",
+    "o3": "raccoon-8c4485",
+    "o4-mini": "raccoon-8c4485"
+  },
+  "upstream": {
+    "llm_base": "",
+    "auth_base": "",
+    "points_base": "",
+    "origin": "",
+    "timeout_seconds": 120,
+    "header_timeout_seconds": 120,
+    "idle_timeout_seconds": 300,
+    "user_agent": "",
+    "client_version": "",
+    "catalog_cache_file": "./data/model_catalog.json"
+  },
+  "cooldown": {
+    "plan_credit": "12h",
+    "soft_rate": "60s",
+    "soft_rate_max": "2h"
+  },
+  "pool": {
+    "strategy": "round_robin",
+    "max_in_flight": 10,
+    "queue_wait": "2s",
+    "breaker_threshold": 3,
+    "breaker_cooldown": "10m",
+    "breaker_cooldown_max": "2h",
+    "degrade_threshold": 5,
+    "degrade_cooldown": "10m",
+    "idle_weight_per_hour": 0.5,
+    "idle_weight_max": 5
+  },
+  "schedule": {
+    "checkin_hours": [9],
+    "keepalive_hours": [3],
+    "checkin_enabled": true,
+    "keepalive_enabled": true,
+    "balance_refresh_enabled": true,
+    "balance_refresh_minutes": 5,
+    "include_disabled_in_tasks": false,
+    "new_account_grace_days": 3,
+    "concurrency": 2
+  },
+  "session_sticky": {
+    "enabled": true,
+    "ttl": "30m",
+    "gc_interval": "5m",
+    "prefix_affinity": false
+  },
+  "prompt": {
+    "mode": "passthrough",
+    "file": ""
+  },
+  "logging": {
+    "request_archive_enabled": true,
+    "request_retention_days": 7,
+    "request_archive_max_mb": 100,
+    "request_client_info": true
+  },
+  "server": {
+    "read_timeout": "300s",
+    "min_output_tokens": 2048
+  },
+  "panel": {
+    "title": "小浣熊网关"
+  },
+  "import": {
+    "client_dirs": []
+  },
+
+  "login": {
+    "enabled": true,
+    "app_name": "办公小浣熊客户端",
+    "callback_base": ""
+  },
+  "images": {
+    "enabled": true,
+    "model": "",
+    "timeout_seconds": 300,
+    "return_url": false,
+    "public_base": "",
+    "dir": "",
+    "cos": {
+      "enabled": false,
+      "secret_id": "",
+      "secret_key": "",
+      "bucket": "",
+      "region": "ap-guangzhou",
+      "prefix": "xhx",
+      "base_url": "",
+      "public_read": true,
+      "signed_ttl_seconds": 0
+    },
+    "aliases": ["gpt-image-1", "gpt-image-1-mini", "gpt-image-2", "gpt-image-2.5", "dall-e-2", "dall-e-3"]
+  },
+
+  "models": {
+    "hidden": [],
+    "include_upstream_hidden": true
+  },
+  "shutdown_timeout_seconds": 10
+}

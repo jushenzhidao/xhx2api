@@ -1,0 +1,12 @@
+# 构建上下文瘦身：凭证与运行期数据绝不进镜像
+.git
+.github
+auths
+data
+config.json
+*.log
+xhx2api
+server
+dist
+.workbuddy
+.DS_Store

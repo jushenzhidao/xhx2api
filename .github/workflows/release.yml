@@ -1,0 +1,155 @@
+name: release
+
+# 发版：push main 自动 patch 自增 → 跑测试 → 构建 6 平台二进制 → 打 tag → 建 Release。
+#
+# 为什么构建放在这个 workflow 里而不是复用 ci.yml：
+#   GITHUB_TOKEN 推送的 tag **不会触发**其他 workflow。若这里只打 tag，
+#   监听 tag 的构建永远不会跑，Release 会是一个没有附件的空壳。
+#   同理，docker-ghcr.yml 的 `on.push.tags` 也接不到这里打的 tag ——
+#   镜像版本 tag 由 docker-ghcr.yml 在 push main 时以 `sha-<7位>` / `latest`
+#   形式产出，部署按那个取（见 deploy/README.md）。
+#
+# 逃生阀：bump 提交自身带 [skip release]，否则 bump → 新 push → 再发版无限循环。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要补发的 tag（须已存在，如 v1.2.0）；留空则按 patch 自增"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+# 同分支串行：并发发版会各自读到同一个 tag 再各自自增，必然撞版本。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: ${{ !contains(github.event.head_commit.message || '', '[skip release]') }}
+    runs-on: ubuntu-latest
+    steps:
+      # 补发（workflow_dispatch）必须检出「那个 tag」，不是默认分支最新提交；
+      # 分支 push 必须钉住 sha，因为 github.ref 是会移动的指针。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 缺这个拿不到历史 tag，版本号永远是 v0.0.1
+          ref: ${{ inputs.tag || github.sha }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          INPUT_TAG="${{ inputs.tag }}"
+          if [ -n "$INPUT_TAG" ]; then
+            VERSION="${INPUT_TAG#v}"
+            echo "mode=tag" >> "$GITHUB_OUTPUT"
+          else
+            # --sort=-v:refname 而不是 git describe：后者在有合并历史时会挑错版本。
+            LAST=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+            if [ -z "$LAST" ]; then
+              VERSION="0.1.0"
+            else
+              base="${LAST#v}"
+              IFS='.' read -r major minor patch <<< "$base"
+              patch="${patch%%[-+]*}" # 剥掉 -rc.1 之类后缀，否则 $(( )) 报错
+              VERSION="${major}.${minor}.$((patch + 1))"
+            fi
+            echo "mode=auto" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "解析版本：$VERSION"
+
+      - name: Test
+        run: go test ./...
+
+      # Release 正文自己用 git log 生成：`generate_release_notes` 依赖「已合并 PR」，
+      # 直推 main 的仓库里它只产出一行 compare 链接（空正文）。
+      - name: Build changelog
+        id: notes
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.ver.outputs.tag }}"
+          if [ "${{ steps.ver.outputs.mode }}" = "tag" ]; then
+            PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || echo "")
+            RANGE="${PREV:+$PREV..}${TAG}"
+          else
+            PREV=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)
+            RANGE="${PREV:+$PREV..}HEAD"
+          fi
+          LIMIT=""
+          if [ -z "$PREV" ]; then LIMIT="--max-count=50"; fi # 首版别把全史都贴进去
+          {
+            echo "body<<CHANGELOG_EOF"
+            if [ -n "$PREV" ]; then echo "**自 ${PREV} 以来的变更**"; else echo "**首个版本**"; fi
+            echo
+            # shellcheck disable=SC2086
+            git log $RANGE $LIMIT --no-merges --pretty='- %s (%h)'
+            echo
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV:-v0.0.0}...${TAG}"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          targets=(
+            "linux amd64"
+            "linux arm64"
+            "linux 386"
+            "darwin amd64"
+            "darwin arm64"
+            "windows amd64"
+          )
+          for target in "${targets[@]}"; do
+            read -r goos goarch <<< "$target"
+            ext=""
+            [ "$goos" = "windows" ] && ext=".exe"
+            name="xhx2api_${VERSION}_${goos}_${goarch}"
+            echo "→ $name"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath \
+              -ldflags="-s -w -X github.com/rsfree/xhx2api/internal/version.Version=v${VERSION}" \
+              -o "dist/${name}${ext}" ./cmd/server
+            (cd dist && if [ "$goos" = "windows" ]; then zip -q "${name}.zip" "${name}${ext}"; else tar czf "${name}.tar.gz" "${name}"; fi)
+          done
+          rm -f dist/xhx2api_*_*_* 2>/dev/null || true
+          ls -lh dist
+
+      # tag 在镜像构建之后：先出二进制再承诺版本，构建失败不会留下「有 tag 没产物」。
+      - name: Tag
+        if: ${{ steps.ver.outputs.mode == 'auto' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.ver.outputs.tag }}"
+          git push origin "${{ steps.ver.outputs.tag }}"
+
+      - name: Bump version in source
+        if: ${{ steps.ver.outputs.mode == 'auto' }}
+        run: |
+          # 把新版本写回源码默认值，本地 go build 也有据可查；提交带 [skip release] 防循环。
+          sed -i "s#^var Version = .*#var Version = \"v${{ steps.ver.outputs.version }}\"#" internal/version/version.go
+          git add internal/version/version.go
+          git commit -m "chore(release): v${{ steps.ver.outputs.version }} [skip release]" || true
+          git push origin HEAD:main || true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          body: ${{ steps.notes.outputs.body }}
+          files: dist/*

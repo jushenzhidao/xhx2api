@@ -1,0 +1,20 @@
+# 运行期数据（含凭证），绝不进版本库
+auths/
+data/
+config.json
+*.log
+
+# 构建产物（server 是历史遗留的本地二进制）
+/xhx2api
+/server
+/dist/
+*.test
+
+# 编辑器/系统
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# .workbuddy 是项目数据（记忆/分析），不进仓库
+.workbuddy/

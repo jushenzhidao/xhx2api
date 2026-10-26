@@ -1,0 +1,209 @@
+package main
+
+import (
+	"os"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestStripJSONC(t *testing.T) {
+	src := []byte(`{
+	  // 行注释
+	  "listen": ":7867", /* 块注释 */
+	  "upstream": { "user_agent": "http://example.com/a" }, // 字符串里的 // 不能被当注释
+	  "models": { "hidden": ["a", "b",], },
+	}`)
+	out := string(stripJSONC(src))
+	if strings.Contains(out, "行注释") || strings.Contains(out, "块注释") {
+		t.Fatalf("注释没被去掉:\n%s", out)
+	}
+	if !strings.Contains(out, "http://example.com/a") {
+		t.Fatalf("字符串里的 // 被误删:\n%s", out)
+	}
+	if strings.Contains(out, `"b",`) || strings.Contains(out, "}, }") {
+		t.Fatalf("尾逗号没被去掉:\n%s", out)
+	}
+	// 去注释后应当能解析。
+	cfg, err := ParseConfig(src)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if cfg.Listen != ":7867" {
+		t.Fatalf("listen = %q", cfg.Listen)
+	}
+}
+
+func TestParseConfigRejectsUnknownKey(t *testing.T) {
+	_, err := ParseConfig([]byte(`{"listne": ":7867"}`))
+	if err == nil {
+		t.Fatal("未知键应当报错（写错键名静默忽略会让人排查半天）")
+	}
+	if !strings.Contains(err.Error(), "listne") {
+		t.Fatalf("错误信息应点出键名: %v", err)
+	}
+}
+
+func TestParseConfigAllowsCommentKeys(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`{"_comment":"说明","listen":":9000"}`))
+	if err != nil {
+		t.Fatalf("_comment 应当被允许: %v", err)
+	}
+	if cfg.Listen != ":9000" {
+		t.Fatalf("listen = %q", cfg.Listen)
+	}
+}
+
+func TestDefaults(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != "0.0.0.0:7867" {
+		t.Fatalf("默认监听 = %q", cfg.Listen)
+	}
+	if cfg.DefaultModel != "raccoon-8c4485" {
+		t.Fatalf("默认模型 = %q", cfg.DefaultModel)
+	}
+	if len(cfg.Schedule.CheckinHours) != 1 || cfg.Schedule.CheckinHours[0] != 9 {
+		t.Fatalf("默认签到小时 = %v", cfg.Schedule.CheckinHours)
+	}
+	if cfg.upstreamShort != 120*time.Second {
+		t.Fatalf("upstream short = %v", cfg.upstreamShort)
+	}
+	// 别名表要能让 gpt-4o 落到上游模型。
+	if cfg.Aliases["gpt-4o"] != "raccoon-chat-ml-5-5" {
+		t.Fatalf("别名表不对: %v", cfg.Aliases)
+	}
+}
+
+func TestParseConfigRejectsBadDuration(t *testing.T) {
+	if _, err := ParseConfig([]byte(`{"cooldown":{"soft_rate":"一分钟"}}`)); err == nil {
+		t.Fatal("非法时长应当报错")
+	}
+}
+
+func TestParseConfigRejectsBadHour(t *testing.T) {
+	if _, err := ParseConfig([]byte(`{"schedule":{"checkin_hours":[25]}}`)); err == nil {
+		t.Fatal("非法小时应当报错")
+	}
+}
+
+func TestSaveConfigMergesUnknownKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/config.json"
+	// 原文件带一个未来版本才有的键与一个注释键。
+	if err := os.WriteFile(path, []byte(`{"listen":":7867","_comment":"手写说明","future_key":{"a":1}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 面板只提交它管理的字段。
+	next, restart, err := SaveConfig(path, []byte(`{"api_key":"sk-test","listen":":9999","models":{"include_upstream_hidden":false}}`))
+	if err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	if next.APIKey != "sk-test" {
+		t.Fatalf("api_key = %q", next.APIKey)
+	}
+	// 只列真正变化的需重启字段：listen 变了要提示，api_key 是热改不该出现。
+	var hasListen, hasAPIKey, hasUnlisted bool
+	for _, field := range restart {
+		switch field {
+		case "listen":
+			hasListen = true
+		case "api_key":
+			hasAPIKey = true
+		case "models.include_upstream_hidden":
+			hasUnlisted = true
+		}
+	}
+	if !hasListen {
+		t.Fatalf("listen 改动应当提示重启: %v", restart)
+	}
+	if hasAPIKey {
+		t.Fatalf("api_key 是热改字段，不该出现在重启清单: %v", restart)
+	}
+	// 这个开关是启动时注入 handler 的，改了必须重启——不提示就是在骗用户。
+	if !hasUnlisted {
+		t.Fatalf("models.include_upstream_hidden 改动应当提示重启: %v", restart)
+	}
+	if next.Models.IncludeUpstreamHidden == nil || *next.Models.IncludeUpstreamHidden {
+		t.Fatalf("新值没生效: %+v", next.Models.IncludeUpstreamHidden)
+	}
+	rawBytes, _ := os.ReadFile(path)
+	raw := string(rawBytes)
+	if !strings.Contains(raw, "future_key") || !strings.Contains(raw, "_comment") {
+		t.Fatalf("未知键被洗掉了:\n%s", raw)
+	}
+	if !strings.Contains(raw, "sk-test") {
+		t.Fatalf("新值没写进去:\n%s", raw)
+	}
+	// 落盘权限：配置里有密钥。
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("配置权限 = %o, want 600", mode)
+	}
+}
+
+func TestMergeMapsDeep(t *testing.T) {
+	cur := map[string]any{"a": map[string]any{"x": 1, "y": 2}}
+	in := map[string]any{"a": map[string]any{"y": 3}}
+	out := mergeMaps(cur, in)
+	nested := out["a"].(map[string]any)
+	if nested["x"] != 1 || nested["y"] != 3 {
+		t.Fatalf("深合并结果不对: %v", nested)
+	}
+}
+
+func TestCallbackBase(t *testing.T) {
+	cases := map[string]string{
+		"0.0.0.0:7867":     "http://127.0.0.1:7867",
+		":7867":            "http://127.0.0.1:7867",
+		"127.0.0.1:9000":   "http://127.0.0.1:9000",
+		"192.168.1.5:7867": "",
+	}
+	for listen, want := range cases {
+		if got := callbackBase(listen); got != want {
+			t.Fatalf("callbackBase(%q) = %q, want %q", listen, got, want)
+		}
+	}
+}
+
+func TestResolveCallbackBase(t *testing.T) {
+	cases := []struct {
+		name   string
+		listen string
+		config string
+		want   string
+	}{
+		// 配置优先：线上部署填域名，忽略监听地址。
+		{"配置域名", "0.0.0.0:7867", "https://xhx2api.1task.cn", "https://xhx2api.1task.cn"},
+		{"配置带尾斜杠", "0.0.0.0:7867", "https://xhx2api.1task.cn/", "https://xhx2api.1task.cn"},
+		// 未配置：按 listen 推导。
+		{"本机通配", "0.0.0.0:7867", "", "http://127.0.0.1:7867"},
+		{"本机回环", "127.0.0.1:9000", "", "http://127.0.0.1:9000"},
+		// 监听在具体非环回 IP 且没配域名：推导为空，面板会提示改用粘贴。
+		{"局域网 IP", "192.168.1.5:7867", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaults()
+			cfg.Listen = tc.listen
+			cfg.Login.CallbackBase = tc.config
+			if got := resolveCallbackBase(cfg); got != tc.want {
+				t.Fatalf("resolveCallbackBase = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMaskKey(t *testing.T) {
+	if maskKey("") != "(空：不鉴权)" {
+		t.Fatal("空密钥提示不对")
+	}
+	if got := maskKey("sk-xhx-1234567890abcdef"); strings.Contains(got, "567890abcdef") {
+		t.Fatalf("密钥没脱敏: %q", got)
+	}
+}

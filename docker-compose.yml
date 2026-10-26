@@ -1,0 +1,29 @@
+services:
+  xhx2api:
+    build:
+      context: .
+      args:
+        VERSION: ${VERSION:-dev}
+    image: xhx2api:latest
+    container_name: xhx2api
+    restart: unless-stopped
+    # 容器以 uid 10001 运行。宿主机挂载目录属主不同会导致
+    # 「写入 auths/*.json.tmp 失败 permission denied」，三种解法任选：
+    #   1) 让容器以你自己的 uid 运行：PUID=$(id -u) PGID=$(id -g) docker compose up -d
+    #   2) sudo chown -R 10001:10001 ./auths ./data ./config.json
+    #   3) user: "0:0" 以 root 运行（省事但逃逸面更大，自担）
+    user: "${PUID:-10001}:${PGID:-10001}"
+    environment:
+      - TZ=Asia/Shanghai
+      # 也可以用环境变量覆盖配置（优先级高于 config.json）：
+      # - XHX_API_KEY=sk-xhx-xxxx
+      # - XHX_LISTEN=0.0.0.0:7867
+    ports:
+      - "7867:7867"
+    volumes:
+      - ./auths:/app/auths
+      - ./data:/app/data
+      # 注意：宿主机必须先有 config.json（cp config.example.json config.json）。
+      # 缺失时 Docker 会把挂载点创建成目录，容器启动失败。
+      # 不挂 :ro：面板「配置」页要写回这个文件。
+      - ./config.json:/app/config.json

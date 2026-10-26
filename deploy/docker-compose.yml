@@ -1,0 +1,41 @@
+# 生产部署（Docker + nginx 前置）
+#
+# 与仓库根的 docker-compose.yml 的区别：
+#   - 监听 127.0.0.1:7867（只让本机 nginx 访问，不直接暴露公网）
+#   - 挂载 ./deploy/config.json（生产配置，含 login.callback_base）
+#
+# 用法：
+#   cp config.example.json deploy/config.json
+#   # 编辑 deploy/config.json：
+#   #   "listen": "127.0.0.1:7867"
+#   #   "api_key": "<随机生成>"
+#   #   "login": { "callback_base": "https://xhx2api.1task.cn" }
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+services:
+  xhx2api:
+    build:
+      context: ..
+      args:
+        VERSION: ${VERSION:-dev}
+    image: xhx2api:latest
+    container_name: xhx2api
+    restart: unless-stopped
+    # 容器以 uid 10001 运行；宿主机目录属主不同时用 PUID/PGID 覆盖。
+    user: "${PUID:-10001}:${PGID:-10001}"
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      # 只绑回环：公网流量必须经 nginx（TLS + 限流 + 访问日志）。
+      - "127.0.0.1:7867:7867"
+    volumes:
+      - ../auths:/app/auths
+      - ../data:/app/data
+      - ./config.json:/app/config.json
+    healthcheck:
+      # 镜像自带的 HEALTHCHECK 打 /healthz（恒 200）；这里再声明一次便于 compose 观测。
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7867/healthz >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
