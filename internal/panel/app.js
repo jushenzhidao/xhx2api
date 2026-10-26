@@ -1599,10 +1599,21 @@
 
   async function boot() {
     // 空密钥也试一次：配置里 api_key 为空的面板应当直接进入。
-    const ok = await tryEnter(state.key);
-    if (!ok && state.key) showLogin("密钥无效，请重新输入");
-    else if (!ok) showLogin("");
-    startLogTimer();
+    //
+    // 整个流程必须兜住异常：以前 showLogin 只挂在 `!ok` 分支上，任何一个
+    // 未预期的抛错（接口返回非 JSON、元素缺失）都会让 boot 静默 reject，
+    // 页面停在 #app hidden 的状态 —— 用户看到的就是纯白（比报错难查得多）。
+    try {
+      const ok = await tryEnter(state.key);
+      if (!ok) showLogin(state.key ? "密钥无效，请重新输入" : "");
+    } catch (e) {
+      showLogin("进入失败：" + ((e && e.message) || "未知错误"));
+    }
+    try {
+      startLogTimer();
+    } catch (e) {
+      console.warn("[panel] 日志定时器启动失败", e);
+    }
   }
 
   boot();

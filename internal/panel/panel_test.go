@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -177,5 +178,78 @@ func TestModelsPayloadMarksAliasesAndOrphans(t *testing.T) {
 	}
 	if len(payload.Orphans) != 1 || payload.Orphans[0].Alias != "claude-x" || payload.Orphans[0].Target != "ghost-model" {
 		t.Fatalf("目录外的别名目标应当单独列出: %+v", payload.Orphans)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 面板静态结构（无浏览器也能守的回归）
+
+// TestLoginModalOutsideApp 守「未登录时不能白屏」。
+//
+// 2026-10-26 线上实测：`#modal-login` 曾写在 `#app` 内部，而 showLogin() 的
+// 第一行就是 `$("#app").hidden = true` —— 登录框跟着容器一起被隐藏，无 key
+// 首次访问时整页纯白。本地一直用 `?key=` 直达，所以这条路径长期没被覆盖。
+//
+// 这里用标签配平算出 #app 的真实闭合位置，断言登录框在它之后 —— 纯字符串
+// 操作，不依赖浏览器，CI 里几毫秒就能拦住同类改动。
+func TestLoginModalOutsideApp(t *testing.T) {
+	raw, err := panelFS.ReadFile("index.html")
+	if err != nil {
+		t.Fatalf("读取 index.html: %v", err)
+	}
+	s := string(raw)
+	// 必须从 `<div` 起算：从 `id="app"` 起算会把「第一个内层 div」当容器，
+	// 配平会提前结束（实测返回 240 字符处），测试就成了永远通过的空转。
+	start := strings.Index(s, `<div id="app"`)
+	if start < 0 {
+		t.Fatal("index.html 里找不到 #app")
+	}
+	close := divCloseIndex(s, start)
+	if close < 0 {
+		t.Fatal("#app 的 <div> 没有配平（结构损坏）")
+	}
+	login := strings.Index(s, `id="modal-login"`)
+	if login < 0 {
+		t.Fatal("index.html 里找不到 #modal-login")
+	}
+	if login < close {
+		t.Fatalf("#modal-login 在 #app 内部（app 开标签 %d、闭合 %d、登录框 %d）——"+
+			"showLogin() 会先隐藏 #app，登录框跟着消失，未登录时页面纯白", start, close, login)
+	}
+	// 登录框自身初始必须是 hidden：带着遮罩渲染会在已登录场景闪一下。
+	if !strings.Contains(s[login-40:login+40], "hidden") {
+		t.Errorf("#modal-login 初始应带 hidden 属性")
+	}
+}
+
+// divCloseIndex 从 start 处的 <div 开始做标签配平，返回配平后的位置（含 </div> 末尾）。
+func divCloseIndex(s string, start int) int {
+	depth := 0
+	for i := start; i < len(s); {
+		switch {
+		case strings.HasPrefix(s[i:], "<div"):
+			depth++
+			i += 4
+		case strings.HasPrefix(s[i:], "</div>"):
+			depth--
+			i += 6
+			if depth == 0 {
+				return i
+			}
+		default:
+			i++
+		}
+	}
+	return -1
+}
+
+// TestPanelHasFavicon 守「控制台不刷 404」：favicon 用内联 data URI，不额外发请求。
+func TestPanelHasFavicon(t *testing.T) {
+	raw, err := panelFS.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `rel="icon"`) {
+		t.Fatal("index.html 缺少 favicon，浏览器会自动请求 /favicon.ico 并得到 404")
 	}
 }
