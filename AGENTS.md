@@ -53,7 +53,10 @@ tag 与 `latest`（默认分支）。
 | `raccoon-chat-ml-5-5` 计费 | 目录未公布倍率；1,990 token 扣 3 分，与 x1 的 `raccoon-8c4485` 一致 → 按 x1 估 | 模型页「目录外」卡片文案 |
 | 思考吃光额度 | 同一 prompt 的思考量波动 90-4000+ token，`max_tokens=1024` 会偶发「空正文 + finish=length」。默认下限 2048；非流式自动加额到 8192 重试一次；流式补 `reasoning_exhausted` 错误帧 | `bodyfix.go`、`sse.go#finishStream`、`handler.go` 的 escalated |
 | 模型特性 | `sn-*` 全为思考型（一句「收到」烧 21-224 思考 token，首字 5.6-17.4s）；`raccoon-*` 不思考、16 token 结束、首字 14-27s。首字最快 `sn-glm-5-3` | `livecheck -all-models` |
-| 生图端点 | `POST {llm}/images/gen`，OpenAI Images 形状；**只有 `prompt` 必填**（空值 400 `RelayImageForm.Prompt required`）；`size`/`quality` 生效；返回 `data[0].b64_json`，**无 url** | `upstream.GenerateImage`、`server.imageGenerations` |
+| 生图端点 | `POST {llm}/images/gen`，OpenAI Images 形状；**只有 `prompt` 必填**（空值 400 `RelayImageForm.Prompt required`）；`size`/`quality` 生效；上游只回 `data[0].b64_json`，**无 url** | `upstream.GenerateImage`、`server.imageGenerations` |
+| image 字段形态 | 三种都收：单张字符串 / 字符串数组 / `null`（= 无图）；元素可为 data URI 或**裸 base64**（含 URL-safe、缺 padding）。`/v1/images/edits` 收 multipart 与 JSON；multipart 下 `image`/`image[]` 可为**文件**或**base64 文本**（同名重复即数组），`mask` 同理。数组里有非字符串 → 400（不静默丢图） | `extractImageRefs`、`decodeImageRef`、`imageEdits` |
+| 生图响应形态 | **默认回 url**（不传 `response_format` / 传 `null`/`None` → `data[0].url`，不附 b64）；`response_format=b64_json` → 只回 b64 且**不落盘**；配置 `images.response_format=both` → 两者都给。落盘失败或无存储 → 回落 b64 + 头 `X-XHX-Image-URL: unavailable`，绝不回 `url:null` | `server.resolveResponseFormat`、`attachImageURLs` |
+| 图片落盘与回收 | 内容寻址 `<sha256前16字节>.<ext>`，`GET /v1/images/<name>` 免鉴权、`immutable` 缓存；超过 `images.max_total_mb`（默认 2048，0=不限）按 mtime 删最旧到 90%，**只删 `imageNameOK` 认得的文件**，节流 1 分钟 | `sweepImageDir` |
 | 生图 `model` 字段 | **完全被忽略**（2026-10-26 实测）：`gpt-image-2`、`gpt-image-2.5`、捏造名全 200，1024x1024 的 `image_tokens` 都是 196；响应体不回 `model`。别指望它切模型 | `upstream.ImageAliases` 注释 |
 | 生图 size | **两条约束**：①最长边 ≤ 3840（超了先跑 106s 再 400）；②总像素 ≤ 8,294,400 = 3840×2160（超了**不报错**，静默降级：3840x3840 → 2880x2880）。实测 `1024x1024`→196 tokens、`1536x1024`→158、`1792x1024`→139、`3840x2160`(4K)→371 | `upstream.ClampImageSize` 提前按两条约束等比压，响应头 `X-XHX-Image-Size` |
 | 4K + quality | `3840x2160&quality=high` → 13342 image_tokens（默认档 371，36 倍）、136s、1806KB；quality 对耗时几乎无影响 | 同上 |

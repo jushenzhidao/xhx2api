@@ -31,9 +31,11 @@ type imageRequest struct {
 	images [][]byte
 	mask   []byte
 	// fields 是白名单参数（size/quality/n/...），原样带过去。
-	fields  map[string]string
-	wantURL bool
-	title   string
+	fields map[string]string
+	// format 是这次响应的形态：url（默认）/ b64_json / both。
+	// 客户端没传 response_format 时取配置的默认值。
+	format string
+	title  string
 	// model 是客户端填的模型名，只用于请求日志/面板归因。
 	//
 	// 上游 /images/gen 完全忽略这个字段（实测 gpt-image-2、gpt-image-2.5 和
@@ -46,6 +48,9 @@ type imageRequest struct {
 const (
 	maxImageBytes   = 20 << 20
 	maxImagesPerReq = 16
+	// maxImageJSONBytes 是图片 JSON 请求体上限，与 multipart 的 64MiB 对齐
+	// （nginx 的 client_max_body_size 也是 64m）。
+	maxImageJSONBytes = 64 << 20
 )
 
 // 允许透传给上游的参数（其余一律丢弃：上游对未声明字段严格校验）。
@@ -68,9 +73,21 @@ const imageRateRetryDelay = 2 * time.Second
 // `image` 支持 data URI 与裸 base64；`null` / `[]` / 空串一律视为「没有图」，
 // 和 OpenAI SDK 的两种空值写法对齐。
 func (h *Handler) imageGenerations(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
-	tr := traceFrom(r.Context())
-	body, err := readBody(r, h.cfg.MaxBodyBytes)
+	h.handleImageJSON(w, r, time.Now(), traceFrom(r.Context()))
+}
+
+// handleImageJSON 解析 OpenAI Images 的 JSON 形态。
+//
+// generations 与 edits 共用它：两个端点的差别只在传输方式（JSON vs multipart），
+// 语义完全一致，所以 /v1/images/edits 收到 JSON 也走这里（见 imageEdits）。
+func (h *Handler) handleImageJSON(w http.ResponseWriter, r *http.Request, started time.Time, tr *requestTrace) {
+	// 用图专用的上限：base64 有 4/3 膨胀，一张 4K PNG 就要 7MB，
+	// 沿用对话的 32MiB 会让「两张 4K 图生图」直接 413。
+	limit := h.cfg.MaxBodyBytes
+	if limit < maxImageJSONBytes {
+		limit = maxImageJSONBytes
+	}
+	body, err := readBody(r, limit)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
@@ -122,7 +139,7 @@ func (h *Handler) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req.wantURL, err = h.checkResponseFormat(payload["response_format"])
+	req.format, err = h.resolveResponseFormat(payload["response_format"])
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
@@ -140,94 +157,169 @@ func (h *Handler) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	h.dispatchImage(w, r, started, tr, req)
 }
 
-// imageEdits 处理 POST /v1/images/edits（multipart 门面）。
+// imageEdits 处理 POST /v1/images/edits。
 //
-// 它与 generations 汇入同一个 dispatchImage：这里只负责把 multipart 拆成
-// 规范形状。多图两种写法都收——重复的 `image` 字段（HTML 表单/curl 常用）
-// 和 `image[]`（SDK 常用），上游两种都认（实测各 200）。
+// 三种请求形态都收，语义完全一致（都是「带输入图的图生图」）：
+//
+//	Content-Type: application/json                            → 与 generations 同一个解析器
+//	Content-Type: multipart/form-data                          → image/image[] 文件或 base64 文本
+//	Content-Type: application/x-www-form-urlencoded            → curl -d 的默认编码
+//
+// 为什么不只认 multipart：OpenAI 的 edits 规范只写了 multipart，但实际客户端
+// 五花八门——有人发 JSON（因为 generations 就是 JSON），有人用 curl -d（默认
+// urlencoded）。因为「编码不同」回一个看不懂的 400，纯属刁难调用方。
 func (h *Handler) imageEdits(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	tr := traceFrom(r.Context())
 
+	ct := strings.ToLower(r.Header.Get("Content-Type"))
+	if strings.HasPrefix(ct, "application/json") {
+		h.handleImageJSON(w, r, started, tr)
+		return
+	}
+
 	const maxEditBytes = 64 << 20
 	r.Body = http.MaxBytesReader(w, r.Body, maxEditBytes)
-	if err := r.ParseMultipartForm(maxEditBytes); err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-			"需要 multipart/form-data（image=图片文件、prompt=文本）："+err.Error())
-		return
-	}
-	defer func() {
-		if r.MultipartForm != nil {
-			_ = r.MultipartForm.RemoveAll()
-		}
-	}()
 
-	req := imageRequest{prompt: strings.TrimSpace(r.FormValue("prompt")), fields: map[string]string{}}
-	if req.prompt == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "prompt 必填")
-		return
+	var values map[string][]string
+	var files map[string][]*multipart.FileHeader
+	urlencoded := strings.HasPrefix(ct, "application/x-www-form-urlencoded")
+
+	if urlencoded {
+		if err := r.ParseForm(); err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "表单解析失败: "+err.Error())
+			return
+		}
+		values = r.PostForm
+	} else {
+		if err := r.ParseMultipartForm(maxEditBytes); err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+				"需要 multipart/form-data、application/json 或 x-www-form-urlencoded（image 传文件或 base64）："+err.Error())
+			return
+		}
+		defer func() {
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
+			}
+		}()
+		values = r.MultipartForm.Value
+		files = r.MultipartForm.File
 	}
-	var err error
-	req.wantURL, err = h.checkResponseFormat(r.FormValue("response_format"))
+
+	req, err := buildFormImageRequest(values, files, urlencoded)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
+	req.format, err = h.resolveResponseFormat(formFirst(values, "response_format"))
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	h.dispatchImage(w, r, started, tr, req)
+}
 
-	// 两种字段名都收，保持与客户端习惯一致。
+// formFirst 取表单里某个键的第一个值（表单值天然是 []string）。
+func formFirst(values map[string][]string, key string) string {
+	if v := values[key]; len(v) > 0 {
+		return v[0]
+	}
+	return ""
+}
+
+// buildFormImageRequest 把表单拆成规范请求。multipart 与 urlencoded 共用。
+//
+// urlencoded=true 时要把 base64 里的 `+` 还原回来：表单解码会把 `+` 当空格，
+// 而 base64 字母表里本来就有 `+`——不还原的话，含 `+` 的图会静默解错/解不出。
+func buildFormImageRequest(values map[string][]string, files map[string][]*multipart.FileHeader, urlencoded bool) (imageRequest, error) {
+	req := imageRequest{prompt: strings.TrimSpace(formFirst(values, "prompt")), fields: map[string]string{}}
+	if req.prompt == "" {
+		return req, fmt.Errorf("prompt 必填")
+	}
+
+	// 图片有两种进法，都要收：
+	//   1) 文件字段（image / image[]）—— 浏览器表单、curl -F、SDK 都是这种；
+	//   2) 文本字段（同名，值是 base64 或 data URI）—— 把 JSON 硬转表单的
+	//      客户端常这样发；只认文件会让它拿到「image 必填」的 400。
+	var refs []string
 	for _, key := range []string{"image", "image[]"} {
-		for _, fh := range r.MultipartForm.File[key] {
+		for _, fh := range files[key] {
 			// 空 part 表示「没附文件」（浏览器未选文件、或读取失败），
 			// 与 JSON 侧的 null 同义，不能因此报错。
 			if fh.Size == 0 {
 				continue
 			}
 			if fh.Size > maxImageBytes {
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-					fmt.Sprintf("%s 超过 %d MB", fh.Filename, maxImageBytes>>20))
-				return
+				return req, fmt.Errorf("%s 超过 %d MB", fh.Filename, maxImageBytes>>20)
 			}
 			f, oerr := fh.Open()
 			if oerr != nil {
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "读取上传图片失败: "+oerr.Error())
-				return
+				return req, fmt.Errorf("读取上传图片失败: %w", oerr)
 			}
 			blob, rerr := io.ReadAll(io.LimitReader(f, maxImageBytes))
 			_ = f.Close()
 			if rerr != nil {
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "读取上传图片失败: "+rerr.Error())
-				return
+				return req, fmt.Errorf("读取上传图片失败: %w", rerr)
 			}
 			req.images = append(req.images, blob)
 		}
-	}
-	if len(req.images) == 0 {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-			"image 必填（multipart 文件字段，字段名 image 或 image[]）")
-		return
-	}
-	if len(req.images) > maxImagesPerReq {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-			fmt.Sprintf("一次最多 %d 张输入图", maxImagesPerReq))
-		return
-	}
-	if mc, maskHeader, merr := r.FormFile("mask"); merr == nil {
-		defer mc.Close()
-		if maskHeader.Size > 0 {
-			if req.mask, err = io.ReadAll(io.LimitReader(mc, maxImageBytes)); err != nil {
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "读取 mask 失败: "+err.Error())
-				return
+		for _, v := range values[key] {
+			if strings.TrimSpace(v) != "" {
+				refs = append(refs, v)
 			}
 		}
 	}
-	req.title = strings.TrimSpace(r.FormValue("title"))
-	req.model = strings.TrimSpace(r.FormValue("model"))
+	for _, ref := range refs {
+		if urlencoded {
+			ref = strings.ReplaceAll(ref, " ", "+")
+		}
+		blob, derr := decodeImageRef(ref)
+		if derr != nil {
+			return req, fmt.Errorf("image 解码失败: %w", derr)
+		}
+		if len(blob) > maxImageBytes {
+			return req, fmt.Errorf("单张图超过 %d MB", maxImageBytes>>20)
+		}
+		req.images = append(req.images, blob)
+	}
+	if len(req.images) == 0 {
+		return req, fmt.Errorf("image 必填（字段名 image 或 image[]，可传文件或 base64/data URI）")
+	}
+	if len(req.images) > maxImagesPerReq {
+		return req, fmt.Errorf("一次最多 %d 张输入图", maxImagesPerReq)
+	}
+
+	// mask：文件优先，其次是文本形态。
+	if fhs := files["mask"]; len(fhs) > 0 && fhs[0].Size > 0 {
+		f, oerr := fhs[0].Open()
+		if oerr != nil {
+			return req, fmt.Errorf("读取 mask 失败: %w", oerr)
+		}
+		defer f.Close()
+		blob, rerr := io.ReadAll(io.LimitReader(f, maxImageBytes))
+		if rerr != nil {
+			return req, fmt.Errorf("读取 mask 失败: %w", rerr)
+		}
+		req.mask = blob
+	} else if v := strings.TrimSpace(formFirst(values, "mask")); v != "" {
+		if urlencoded {
+			v = strings.ReplaceAll(v, " ", "+")
+		}
+		blob, derr := decodeImageRef(v)
+		if derr != nil {
+			return req, fmt.Errorf("mask 解码失败: %w", derr)
+		}
+		req.mask = blob
+	}
+
+	req.title = strings.TrimSpace(formFirst(values, "title"))
+	req.model = strings.TrimSpace(formFirst(values, "model"))
 	for _, key := range imageFieldWhitelist {
-		if v := strings.TrimSpace(r.FormValue(key)); v != "" {
+		if v := strings.TrimSpace(formFirst(values, key)); v != "" {
 			req.fields[key] = v
 		}
 	}
-	h.dispatchImage(w, r, started, tr, req)
+	return req, nil
 }
 
 // dispatchImage 按「有没有输入图」选上游端点。
@@ -264,7 +356,7 @@ func (h *Handler) dispatchImage(w http.ResponseWriter, r *http.Request, started 
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "rewrite body: "+err.Error())
 			return
 		}
-		h.serveImage(w, r, started, tr, req.wantURL, func(ctx context.Context, a *auth.Auth) (*upstream.ImageReply, error) {
+		h.serveImage(w, r, started, tr, req.format, func(ctx context.Context, a *auth.Auth) (*upstream.ImageReply, error) {
 			return h.cfg.Upstream.GenerateImage(ctx, a, out, req.title)
 		})
 		return
@@ -276,7 +368,7 @@ func (h *Handler) dispatchImage(w http.ResponseWriter, r *http.Request, started 
 		writeOpenAIError(w, http.StatusInternalServerError, "internal_error", "构造上游请求失败: "+err.Error())
 		return
 	}
-	h.serveImage(w, r, started, tr, req.wantURL, func(ctx context.Context, a *auth.Auth) (*upstream.ImageReply, error) {
+	h.serveImage(w, r, started, tr, req.format, func(ctx context.Context, a *auth.Auth) (*upstream.ImageReply, error) {
 		return h.cfg.Upstream.EditImage(ctx, a, body, contentType, req.title)
 	})
 }
@@ -322,16 +414,52 @@ func buildEditMultipart(req imageRequest) ([]byte, string, error) {
 	return buf.Bytes(), mw.FormDataContentType(), nil
 }
 
-// checkResponseFormat 统一处理 response_format：url 需要配置开启。
-func (h *Handler) checkResponseFormat(v any) (bool, error) {
-	format := strings.TrimSpace(scalarString(v))
-	if !strings.EqualFold(format, "url") {
-		return false, nil
+// resolveResponseFormat 决定这次响应回什么形态。
+//
+// 客户端没传（空 / null / None）时用配置的默认值（默认 url）；传了就以客户端
+// 为准，只接受 url / b64_json。"both" 只作为配置项存在——它意味着多传几 MB base64，
+// 客户端真要两者，完全可以从 url 自己拉一次。
+func (h *Handler) resolveResponseFormat(v any) (string, error) {
+	raw := strings.ToLower(strings.TrimSpace(scalarString(v)))
+	// JSON 的 null 解出来就是 nil（scalarString 给空串）；multipart 里删掉字段
+	// 也是空串。再容忍字面量 "none"/"null"——Python 侧
+	// `response_format=None` 被某些客户端直接拼成字符串发过来，
+	// 那不是「要 None 形态」，语义与不传完全一样。
+	if raw == "none" || raw == "null" {
+		raw = ""
 	}
-	if !h.cfg.ImageReturnURL {
-		return false, fmt.Errorf("上游只返回 base64，没有可访问的图片 URL；要 url 请先开启 images.return_url（网关会落盘或传对象存储并提供链接）")
+	if raw == "" {
+		switch f := strings.ToLower(strings.TrimSpace(h.cfg.ImageDefaultFormat)); f {
+		case "b64_json":
+			return "b64_json", nil
+		case "both":
+			if h.canServeURL() {
+				return "both", nil
+			}
+			return "b64_json", nil
+		default: // "url"（默认）或未配置
+			if h.canServeURL() {
+				return "url", nil
+			}
+			// 没点名要 url 时不报错：静默回落 base64，功能不因此中断。
+			return "b64_json", nil
+		}
 	}
-	return true, nil
+	switch raw {
+	case "url":
+		if !h.canServeURL() {
+			return "", fmt.Errorf("图片 url 不可用：images.return_url 已关闭且未接对象存储；去掉 response_format，或显式传 b64_json")
+		}
+		return "url", nil
+	case "b64_json":
+		return "b64_json", nil
+	}
+	return "", fmt.Errorf("response_format 只支持 url 或 b64_json，收到 %q", raw)
+}
+
+// canServeURL 表示网关此刻真能把图变成链接：本地目录与对象存储二者其一。
+func (h *Handler) canServeURL() bool {
+	return h.cfg.ImageReturnURL && (h.cfg.ImageDir != "" || h.cfg.ImageUploader != nil)
 }
 
 // extractImageRefs 接受 null / 字符串 / 字符串数组，空值表示没有图。
@@ -358,7 +486,7 @@ func extractImageRefs(v any) ([]string, error) {
 		}
 		return out, nil
 	}
-	return nil, fmt.Errorf("image 必须是字符串或字符串数组")
+	return nil, fmt.Errorf("image 必须是字符串、字符串数组或 null（支持 base64 与 data URI）")
 }
 
 // decodeImageRef 把 data URI 或裸 base64 解成字节。
@@ -436,7 +564,7 @@ type imageSender func(ctx context.Context, a *auth.Auth) (*upstream.ImageReply, 
 // 抽出来是为了让两条路由共享同一套换号与错误分类：图生图的失败模式和生图
 // 完全一致（超时不换号、账号级错误才换号），复制一份迟早会分叉。
 func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, started time.Time,
-	tr *requestTrace, wantURL bool, send imageSender) {
+	tr *requestTrace, format string, send imageSender) {
 	var lastErr error
 	var lastKind pool.ErrKind
 	excluded := map[string]bool{}
@@ -520,12 +648,20 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, started tim
 		}
 		h.recordUsage(tr, upstream.ImageModelID, false, promptTokens, completionTokens, total, elapsed)
 		body := reply.Body
-		if h.cfg.ImageReturnURL && (h.cfg.ImageDir != "" || h.cfg.ImageUploader != nil) {
-			if out, uerr := h.attachImageURLs(r, body, wantURL); uerr == nil {
-				body = out
-			} else {
+		// b64_json 时完全不碰磁盘：客户端明确要 base64，没必要为它写一份。
+		if format != "b64_json" && h.canServeURL() {
+			out, attached, uerr := h.attachImageURLs(r, body, format)
+			switch {
+			case uerr != nil:
 				// 落盘失败不该让整次生成白费：图还是给客户端，只是没有 url。
-				log.Printf("WARN: [images] 生成 url 失败: %v", uerr)
+				log.Printf("WARN: [images] 生成 url 失败，回落 base64: %v", uerr)
+				w.Header().Set("X-XHX-Image-URL", "unavailable")
+			case attached == 0:
+				log.Printf("WARN: [images] 没有一张图拿到 url，回落 base64")
+				w.Header().Set("X-XHX-Image-URL", "unavailable")
+			default:
+				body = out
+				w.Header().Set("X-XHX-Image-URL", "ok")
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")

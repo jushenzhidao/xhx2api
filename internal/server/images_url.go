@@ -11,12 +11,16 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"time"
 )
 
 // 图片 URL 支持：上游只回 base64，而一张 4K 图的 base64 有 8MB+，
-// 塞给前端、工作流或消息队列都很难用。开启 images.return_url 后，
-// 网关把图落盘并提供 /v1/images/<id> 直接访问。
+// 塞给前端、工作流或消息队列都很难用。所以网关默认（images.return_url=true）
+// 把图落盘/传对象存储，并提供 /v1/images/<id> 直接访问；客户端没传
+// response_format 时也只回 url。
 
 // ImageUploader 把图片传到外部存储并返回可访问 URL。
 //
@@ -59,24 +63,30 @@ func imageID(blob []byte) string {
 	return hex.EncodeToString(sum[:16])
 }
 
-// attachImageURLs 把响应里每张图落盘，并补上可访问的 url。
+// attachImageURLs 把响应里每张图落盘（或传对象存储），按 format 决定回什么：
 //
-// onlyURL=true 时删掉 b64_json：客户端显式要 response_format=url，通常就是
-// 为了省掉那几 MB 的 base64。
-func (h *Handler) attachImageURLs(r *http.Request, body []byte, onlyURL bool) ([]byte, error) {
+//	url   —— 只回 url，删掉 b64_json（默认；省掉几 MB base64）
+//	both  —— url 与 b64_json 都给
+//
+// 只对**真的拿到链接**的那张做处理：失败的那张保留 b64_json，客户端仍能取到图，
+// 不会因为一次落盘失败让整次生成白费。返回改写后的响应与成功拿到 url 的张数。
+func (h *Handler) attachImageURLs(r *http.Request, body []byte, format string) ([]byte, int, error) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return body, fmt.Errorf("响应不是 JSON: %w", err)
+		return body, 0, fmt.Errorf("响应不是 JSON: %w", err)
 	}
 	items, _ := payload["data"].([]any)
 	if len(items) == 0 {
-		return body, nil
+		return body, 0, nil
 	}
 	ext := imageExtByFormat(fmt.Sprint(payload["output_format"]))
 	base := h.imagePublicBase(r)
-	if err := os.MkdirAll(h.cfg.ImageDir, 0o700); err != nil {
-		return body, fmt.Errorf("建图片目录失败: %w", err)
+	if h.cfg.ImageDir != "" {
+		if err := os.MkdirAll(h.cfg.ImageDir, 0o700); err != nil {
+			return body, 0, fmt.Errorf("建图片目录失败: %w", err)
+		}
 	}
+	attached := 0
 	for _, it := range items {
 		obj, ok := it.(map[string]any)
 		if !ok {
@@ -117,11 +127,94 @@ func (h *Handler) attachImageURLs(r *http.Request, body []byte, onlyURL bool) ([
 			continue
 		}
 		obj["url"] = link
-		if onlyURL {
+		attached++
+		if format == "url" {
 			delete(obj, "b64_json")
 		}
 	}
-	return json.Marshal(payload)
+	if attached > 0 && h.cfg.ImageDir != "" {
+		// 容量闸门：默认开 url 之后每张图都落盘，不设上限迟早撑满磁盘。
+		sweepImageDir(h.cfg.ImageDir, h.cfg.ImageMaxTotalMB)
+	}
+	out, err := json.Marshal(payload)
+	if err != nil {
+		return body, attached, err
+	}
+	return out, attached, nil
+}
+
+var (
+	imageSweepMu sync.Mutex
+	imageSweptAt time.Time
+)
+
+// imageSweepInterval 让容量回收最多每分钟跑一次：每写一张图都全目录 stat
+// 一遍，在几千个文件时纯属浪费。
+const imageSweepInterval = time.Minute
+
+// sweepImageDir 把目录压回总量上限内：按 mtime 从旧到新删，直到降到 90%。
+//
+// 只删 imageNameOK 认得的文件——目录里万一混进别的东西，一个都不能动。
+// maxMB <= 0 表示不限制。返回删掉的文件数与释放字节数。
+//
+// 注意删掉的旧链接会 404：内容寻址只是让同一张图不重复落盘，
+// 不代表这里是永久存储。
+func sweepImageDir(dir string, maxMB int) (files int, freed int64) {
+	if dir == "" || maxMB <= 0 {
+		return 0, 0
+	}
+	imageSweepMu.Lock()
+	defer imageSweepMu.Unlock()
+	if time.Since(imageSweptAt) < imageSweepInterval {
+		return 0, 0
+	}
+	imageSweptAt = time.Now()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, 0
+	}
+	type img struct {
+		name string
+		size int64
+		mod  time.Time
+	}
+	all := make([]img, 0, len(entries))
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() || !imageNameOK(e.Name()) {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		all = append(all, img{name: e.Name(), size: info.Size(), mod: info.ModTime()})
+		total += info.Size()
+	}
+	limit := int64(maxMB) << 20
+	if total <= limit {
+		return 0, 0
+	}
+	// 删到 90%：留点余量，免得刚删完下一张图又触发一轮全目录扫描。
+	target := limit / 10 * 9
+	sort.Slice(all, func(i, j int) bool { return all[i].mod.Before(all[j].mod) })
+	for _, f := range all {
+		if total <= target {
+			break
+		}
+		if rerr := os.Remove(filepath.Join(dir, f.name)); rerr != nil {
+			continue
+		}
+		total -= f.size
+		files++
+		freed += f.size
+	}
+	if files > 0 {
+		log.Printf("INFO: [images] 图片目录超过 %dMB，回收 %d 个最旧的文件（释放 %.1fMB）",
+			maxMB, files, float64(freed)/(1<<20))
+	}
+	return files, freed
 }
 
 // imagePublicBase 决定写进 url 的对外基址。
@@ -189,4 +282,11 @@ func imageNameOK(name string) bool {
 		return true
 	}
 	return false
+}
+
+// resetImageSweepThrottle 清掉节流时间戳（测试用：否则同一分钟内第二次调用直接返回）。
+func resetImageSweepThrottle() {
+	imageSweepMu.Lock()
+	imageSweptAt = time.Time{}
+	imageSweepMu.Unlock()
 }

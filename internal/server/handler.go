@@ -85,12 +85,19 @@ type Config struct {
 	DisableImages bool
 	// ImageModel 指定上游图片模型（空 = 上游默认组 raccoon-image-gen）。
 	ImageModel string
-	// ImageReturnURL 让图片响应带可访问的 url（图落盘）。
+	// ImageReturnURL 表示 url 能力是否可用（配置里 return_url 默认开）。
+	// 关掉时显式要 response_format=url 会 400，默认形态回落 b64_json。
 	ImageReturnURL bool
+	// ImageDefaultFormat 是客户端没传 response_format 时的默认形态：
+	// "url"（默认）/ "b64_json" / "both"。空值按 "url" 处理。
+	ImageDefaultFormat string
 	// ImagePublicBase 是写进 url 的对外基址（空 = 按请求 Host 推导）。
 	ImagePublicBase string
 	// ImageDir 是图片落盘目录（空 = 不落盘，也就不产生 url）。
 	ImageDir string
+	// ImageMaxTotalMB 是落盘目录的总量上限（0 = 不限制）。
+	// 超限后按 mtime 删最旧的，免得默认开 url 之后把磁盘写满。
+	ImageMaxTotalMB int
 	// ImageUploader 非 nil 时图片优先传对象存储，url 用存储地址；
 	// 上传失败自动回落本地落盘（ImageDir 有值时）。
 	ImageUploader ImageUploader

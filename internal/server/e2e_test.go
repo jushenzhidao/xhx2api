@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1664,9 +1665,10 @@ func TestImageEditsRequiresImageField(t *testing.T) {
 	}
 }
 
-// TestImageEditsRejectsJSONBody 守错误提示：拿 JSON 调图生图是最常见的误用，
-// 提示里必须点名 multipart，否则用户只会看到一句「解析失败」。
-func TestImageEditsRejectsJSONBody(t *testing.T) {
+// TestImageEditsAcceptsJSONBodyWithBadImage 守错误定位：
+// edits 现在收 JSON（语义与 generations 一致），但 image 不是合法 base64 时
+// 必须明确说是「image 解码失败」，而不是笼统的「解析失败」。
+func TestImageEditsAcceptsJSONBodyWithBadImage(t *testing.T) {
 	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
 	raw, _ := json.Marshal(map[string]any{"prompt": "换个背景", "image": "base64..."})
 	req, _ := http.NewRequest(http.MethodPost, env.gateway.URL+"/v1/images/edits", bytes.NewReader(raw))
@@ -1678,10 +1680,13 @@ func TestImageEditsRejectsJSONBody(t *testing.T) {
 	defer resp.Body.Close()
 	out, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 400 {
-		t.Fatalf("JSON body 应当 400，实际 %d: %s", resp.StatusCode, out)
+		t.Fatalf("非法 base64 应当 400，实际 %d: %s", resp.StatusCode, out)
 	}
-	if !strings.Contains(string(out), "multipart") {
-		t.Fatalf("错误提示应当点名 multipart: %s", out)
+	if !strings.Contains(string(out), "image") {
+		t.Fatalf("错误提示应当点名 image: %s", out)
+	}
+	if env.editHits.Load() != 0 || env.imageHits.Load() != 0 {
+		t.Fatal("参数错误不该打到上游")
 	}
 }
 
@@ -1741,6 +1746,420 @@ func TestImageURLServedWhenEnabled(t *testing.T) {
 	}
 	if cc := got.Header.Get("Cache-Control"); !strings.Contains(cc, "immutable") {
 		t.Fatalf("内容寻址的图应当可永久缓存，实际 Cache-Control=%q", cc)
+	}
+}
+
+// enableImageURL 打开 url 能力并给一个临时目录（生产装配的等价最小形态）。
+func enableImageURL(t *testing.T, env *testEnv) string {
+	t.Helper()
+	dir := t.TempDir()
+	env.handler.cfg.ImageReturnURL = true
+	env.handler.cfg.ImageDir = dir
+	return dir
+}
+
+// imageItem 取响应里的第一张图，并解析成 map。
+func imageItem(t *testing.T, body []byte) map[string]any {
+	t.Helper()
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		t.Fatalf("响应不是 JSON: %v (%s)", err, body)
+	}
+	items, _ := obj["data"].([]any)
+	if len(items) == 0 {
+		t.Fatalf("没有 data: %s", body)
+	}
+	item, _ := items[0].(map[string]any)
+	if item == nil {
+		t.Fatalf("data[0] 不是对象: %s", body)
+	}
+	return item
+}
+
+// TestImageDefaultsToURL 守产品口径：不传 response_format 就回 url。
+//
+// 默认形态是 url，且**不再附带** b64_json —— 一张 4K 图的 base64 有 8MB+，
+// 两边都给等于默认形态白设。
+func TestImageDefaultsToURL(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	dir := enableImageURL(t, env)
+
+	resp, body := postImage(t, env.gateway.URL, map[string]any{"prompt": "cat"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	item := imageItem(t, body)
+	url, _ := item["url"].(string)
+	if url == "" {
+		t.Fatalf("默认应当回 url: %s", body)
+	}
+	if !strings.Contains(url, "/v1/images/") {
+		t.Fatalf("url 应当指向网关自己的静态路由，得到 %q", url)
+	}
+	if _, has := item["b64_json"]; has {
+		t.Fatal("默认只回 url，不该再附 b64_json")
+	}
+	if got := resp.Header.Get("X-XHX-Image-URL"); got != "ok" {
+		t.Fatalf("响应头应当标注 url 可用，得到 %q", got)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("默认落盘 1 张，实际 %d", len(entries))
+	}
+
+	// url 必须真能取到图。
+	got, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("取图失败: %v", err)
+	}
+	defer got.Body.Close()
+	if got.StatusCode != 200 {
+		t.Fatalf("图片地址返回 %d", got.StatusCode)
+	}
+}
+
+// TestImageNullFormatReturnsURL 守「response_format=None 等同不传」。
+//
+// Python 侧写 response_format=None 会被序列化成 null；有些客户端还会把
+// 字面量 "None" 原样发过来。两种都不算「明确要 base64」。
+func TestImageNullFormatReturnsURL(t *testing.T) {
+	for _, v := range []any{nil, "None", "null", "", "  "} {
+		env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+		enableImageURL(t, env)
+		resp, body := postImage(t, env.gateway.URL, map[string]any{"prompt": "cat", "response_format": v})
+		if resp.StatusCode != 200 {
+			t.Fatalf("response_format=%v HTTP %d: %s", v, resp.StatusCode, body)
+		}
+		item := imageItem(t, body)
+		if u, _ := item["url"].(string); u == "" {
+			t.Fatalf("response_format=%v 应当回 url: %s", v, body)
+		}
+	}
+}
+
+// TestImageB64JSONKeepsBase64 守「客户端明确要 base64 就真的只给 base64」，
+// 而且不该为它写盘（白占磁盘）。
+func TestImageB64JSONKeepsBase64(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	dir := enableImageURL(t, env)
+
+	resp, body := postImage(t, env.gateway.URL, map[string]any{"prompt": "cat", "response_format": "b64_json"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	item := imageItem(t, body)
+	if b, _ := item["b64_json"].(string); b == "" {
+		t.Fatalf("要 b64_json 时必须回 base64: %s", body)
+	}
+	if u, _ := item["url"].(string); u != "" {
+		t.Fatalf("只要 b64_json 时不该附 url，得到 %q", u)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("只要 base64 时不该落盘，实际 %d 个文件", len(entries))
+	}
+	if got := resp.Header.Get("X-XHX-Image-URL"); got != "" {
+		t.Fatalf("没走 url 链路时不该有 X-XHX-Image-URL，得到 %q", got)
+	}
+}
+
+// TestImageBothFormatFromConfig 守 both：配置层同时给 url 与 base64。
+func TestImageBothFormatFromConfig(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	enableImageURL(t, env)
+	env.handler.cfg.ImageDefaultFormat = "both"
+
+	resp, body := postImage(t, env.gateway.URL, map[string]any{"prompt": "cat"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	item := imageItem(t, body)
+	if u, _ := item["url"].(string); u == "" {
+		t.Fatalf("both 应当有 url: %s", body)
+	}
+	if b, _ := item["b64_json"].(string); b == "" {
+		t.Fatalf("both 应当有 b64_json: %s", body)
+	}
+}
+
+// TestImageURLFallbackWhenStorageMissing 守降级：配了 return_url 但既没有
+// 落盘目录也没有对象存储时，默认形态必须回落 base64 而不是回 url:null。
+func TestImageURLFallbackWhenStorageMissing(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	env.handler.cfg.ImageReturnURL = true
+	env.handler.cfg.ImageDir = "" // 没有落盘目录，也没有 uploader
+
+	resp, body := postImage(t, env.gateway.URL, map[string]any{"prompt": "cat"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	item := imageItem(t, body)
+	if b, _ := item["b64_json"].(string); b == "" {
+		t.Fatalf("没有存储时应当回落 base64: %s", body)
+	}
+	if u, _ := item["url"].(string); u != "" {
+		t.Fatalf("没有存储时不该编造 url，得到 %q", u)
+	}
+	if got := resp.Header.Get("X-XHX-Image-URL"); got != "" {
+		t.Fatalf("根本没走 url 链路，不该有这个头（得到 %q）", got)
+	}
+}
+
+// TestImageRejectsUnknownFormat 守「写错形态要报错，不能当没看见」。
+func TestImageRejectsUnknownFormat(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	enableImageURL(t, env)
+
+	resp, body := postImage(t, env.gateway.URL, map[string]any{"prompt": "cat", "response_format": "png"})
+	if resp.StatusCode != 400 {
+		t.Fatalf("非法的 response_format 应当 400，得到 %d: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "response_format") {
+		t.Fatalf("提示里应当点名 response_format: %s", body)
+	}
+	if env.imageHits.Load() != 0 {
+		t.Fatal("参数错误不该打到上游")
+	}
+}
+
+// TestImageWriteFailureFallsBackToBase64 守「落盘失败不能丢图」：
+// ImageDir 指向一个不可写的位置时，响应必须仍带 b64_json。
+func TestImageWriteFailureFallsBackToBase64(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	env.handler.cfg.ImageReturnURL = true
+	// 用一个「文件」当目录：MkdirAll 会失败，整条 url 链路报错。
+	f := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(f, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env.handler.cfg.ImageDir = f
+
+	resp, body := postImage(t, env.gateway.URL, map[string]any{"prompt": "cat"})
+	if resp.StatusCode != 200 {
+		t.Fatalf("落盘失败不该影响出图，HTTP %d: %s", resp.StatusCode, body)
+	}
+	item := imageItem(t, body)
+	if b, _ := item["b64_json"].(string); b == "" {
+		t.Fatalf("落盘失败时必须保留 base64: %s", body)
+	}
+	if got := resp.Header.Get("X-XHX-Image-URL"); got != "unavailable" {
+		t.Fatalf("应当标注 url 不可用，得到 %q", got)
+	}
+}
+
+// TestSweepImageDir 守容量闸门：超上限时只删最旧的**图片**文件。
+func TestSweepImageDir(t *testing.T) {
+	dir := t.TempDir()
+	mk := func(name string, size int, age time.Duration) {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, bytes.Repeat([]byte("a"), size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ts := time.Now().Add(-age)
+		if err := os.Chtimes(path, ts, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 三个 1MB 的图（30min / 20min / 1min 前）+ 一个不该被动的文件。
+	mk("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png", 1<<20, 30*time.Minute)
+	mk("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.png", 1<<20, 20*time.Minute)
+	mk("cccccccccccccccccccccccccccccccc.png", 1<<20, time.Minute)
+	mk("keep.txt", 1<<20, 60*time.Minute)
+
+	resetImageSweepThrottle()
+	files, freed := sweepImageDir(dir, 2)
+	if files == 0 || freed == 0 {
+		t.Fatalf("超过上限应当回收，实际 files=%d freed=%d", files, freed)
+	}
+	left, _ := os.ReadDir(dir)
+	names := map[string]bool{}
+	for _, e := range left {
+		names[e.Name()] = true
+	}
+	if names["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.png"] {
+		t.Fatal("最旧的图应当先被删")
+	}
+	if !names["keep.txt"] {
+		t.Fatal("非图片文件一个都不能动")
+	}
+	if !names["cccccccccccccccccccccccccccccccc.png"] {
+		t.Fatal("最新的图应当保留")
+	}
+
+	// 上限内不该删任何东西。
+	resetImageSweepThrottle()
+	if files, _ := sweepImageDir(dir, 100); files != 0 {
+		t.Fatalf("没超上限不该删文件，实际删了 %d 个", files)
+	}
+	// 0 = 不限制。
+	resetImageSweepThrottle()
+	if files, _ := sweepImageDir(dir, 0); files != 0 {
+		t.Fatalf("0 表示不限制，实际删了 %d 个", files)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// image 字段的三种写法：字符串 / 数组 / 裸 base64
+
+// TestGenerationsAcceptsBareBase64Array 守「数组 + 裸 base64」：
+// 不带 data: 前缀也要认（很多客户端只发 base64 本体）。
+func TestGenerationsAcceptsBareBase64Array(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	resp, body := postImage(t, env.gateway.URL, map[string]any{
+		"prompt": "合成一张海报",
+		"image":  []any{pngB64("a"), pngB64("b")},
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	if env.editHits.Load() != 1 {
+		t.Fatalf("应当打一次上游 edits，实际 %d", env.editHits.Load())
+	}
+	if env.editFileCount != 2 {
+		t.Fatalf("两张裸 base64 都该转成文件发出去，实际 %d", env.editFileCount)
+	}
+}
+
+// TestGenerationsAcceptsSingleBase64String 守「字符串 + 裸 base64」。
+func TestGenerationsAcceptsSingleBase64String(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	resp, body := postImage(t, env.gateway.URL, map[string]any{
+		"prompt": "把背景换成雪山",
+		"image":  pngB64("only"),
+	})
+	if resp.StatusCode != 200 {
+		t.Fatalf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	if env.editHits.Load() != 1 || env.editFileCount != 1 {
+		t.Fatalf("应当把 1 张裸 base64 转给 edits，实际 hits=%d files=%d",
+			env.editHits.Load(), env.editFileCount)
+	}
+	if env.imageHits.Load() != 0 {
+		t.Fatal("带图时不该再打 /images/gen（它会把 image 静默丢掉）")
+	}
+}
+
+// TestGenerationsRejectsNonStringImageElement 守数组元素类型：
+// 非字符串（数字/对象/嵌套数组）要明确报错，而不是静默丢掉一张图。
+func TestGenerationsRejectsNonStringImageElement(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	resp, body := postImage(t, env.gateway.URL, map[string]any{
+		"prompt": "cat",
+		"image":  []any{pngB64("a"), 42},
+	})
+	if resp.StatusCode != 400 {
+		t.Fatalf("数组里的非法元素应当 400，得到 %d: %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "字符串") {
+		t.Fatalf("提示应当说清只收字符串: %s", body)
+	}
+	if env.editHits.Load() != 0 || env.imageHits.Load() != 0 {
+		t.Fatal("参数错误不该打到上游")
+	}
+}
+
+// TestEditsAcceptsJSONBody 守「edits 也收 JSON」：语义与 generations 完全一致，
+// 只因为传输方式不同就 415 没有道理。
+func TestEditsAcceptsJSONBody(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	raw, _ := json.Marshal(map[string]any{
+		"prompt": "把方块改成金色",
+		"image":  "data:image/png;base64," + pngB64("json"),
+	})
+	resp, err := http.Post(env.gateway.URL+"/v1/images/edits", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("JSON 形态的 edits 应当 200，得到 %d: %s", resp.StatusCode, body)
+	}
+	if env.editHits.Load() != 1 {
+		t.Fatalf("应当打上游 edits，实际 %d", env.editHits.Load())
+	}
+	if env.editPrompt != "把方块改成金色" {
+		t.Fatalf("prompt 没透过去: %q", env.editPrompt)
+	}
+}
+
+// TestEditsAcceptsBase64TextForm 守「multipart 里 image 是文本」：
+// 把 JSON 硬转 multipart 的客户端会这么发，只认文件会让它拿到「image 必填」。
+func TestEditsAcceptsBase64TextForm(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	resp, body := postImageEdit(t, env.gateway.URL, "把天空换成晚霞", false,
+		map[string]string{"image": pngB64("text-form")})
+	if resp.StatusCode != 200 {
+		t.Fatalf("文本形态的 image 应当被接受，得到 %d: %s", resp.StatusCode, body)
+	}
+	if env.editHits.Load() != 1 || env.editFileCount != 1 {
+		t.Fatalf("应当转成 1 个文件发给上游，实际 hits=%d files=%d",
+			env.editHits.Load(), env.editFileCount)
+	}
+}
+
+// TestEditsAcceptsURLEncoded 守 curl -d 的默认编码。
+//
+// 关键陷阱：表单解码会把 base64 里的 `+` 变成空格。不还原的话，含 `+` 的图
+// 要么解不出、要么静默解错。所以这里故意挑一个含 `+` 的 base64，并且**不做**
+// URL 编码直接发（就是 `curl -d 'image=<b64>'` 的行为）。
+func TestEditsAcceptsURLEncoded(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+
+	// 找一个 base64 里真的含 '+' 的 PNG 头素材：PNG 魔数是 8 字节，
+	// 不是 3 的倍数，手算对齐很容易翻车，直接扫一遍最省事。
+	blob := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 24)...)
+	b64 := ""
+	for i := 0; i < 256; i++ {
+		blob[8] = byte(i)
+		if cand := base64.StdEncoding.EncodeToString(blob); strings.Contains(cand, "+") {
+			b64 = cand
+			break
+		}
+	}
+	if b64 == "" {
+		t.Fatal("找不到含 '+' 的测试素材")
+	}
+
+	body := "prompt=把背景换成雪山&image=" + b64 // 故意不转义
+	req, _ := http.NewRequest(http.MethodPost, env.gateway.URL+"/v1/images/edits", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("urlencoded 形态应当被接受，得到 %d: %s", resp.StatusCode, out)
+	}
+	if env.editFileCount != 1 {
+		t.Fatalf("应当转成 1 个文件发给上游，实际 %d", env.editFileCount)
+	}
+	if env.editPrompt != "把背景换成雪山" {
+		t.Fatalf("prompt 没透过去: %q", env.editPrompt)
+	}
+}
+
+// TestEditsAcceptsBase64TextArray 守「multipart 里同名文本字段重复」＝数组。
+func TestEditsAcceptsBase64TextArray(t *testing.T) {
+	env := setupEnv(t, sseChat("raccoon-8c4485", "ok"), "1001")
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("prompt", "合成一张海报")
+	_ = mw.WriteField("image", pngB64("one"))
+	_ = mw.WriteField("image", pngB64("two"))
+	_ = mw.Close()
+
+	resp, err := http.Post(env.gateway.URL+"/v1/images/edits", mw.FormDataContentType(), &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("HTTP %d: %s", resp.StatusCode, body)
+	}
+	if env.editFileCount != 2 {
+		t.Fatalf("两个文本 image 都该转成文件，实际 %d", env.editFileCount)
 	}
 }
 

@@ -241,7 +241,9 @@ func main() {
 		DisableImages:         cfg.Images.Enabled != nil && !*cfg.Images.Enabled,
 		ImageModel:            cfg.Images.Model,
 		ImageTimeout:          time.Duration(cfg.Images.TimeoutSeconds) * time.Second,
-		ImageReturnURL:        cfg.Images.ReturnURL || cfg.Images.COS.Enabled,
+		ImageReturnURL:        cfg.ImageURLEnabled(),
+		ImageDefaultFormat:    cfg.ImageDefaultFormat(),
+		ImageMaxTotalMB:       cfg.ImageMaxTotalMB(),
 		ImagePublicBase:       cfg.Images.PublicBase,
 		ImageDir:              imageDirOf(cfg),
 		ImageUploader:         imageUploader,
@@ -321,7 +323,7 @@ func imageDirOf(c *Config) string {
 	if v := strings.TrimSpace(c.Images.Dir); v != "" {
 		return v
 	}
-	if !c.Images.ReturnURL && !c.Images.COS.Enabled {
+	if !c.ImageURLEnabled() {
 		return "" // 既不要 url 也没接对象存储：不落盘
 	}
 	return stateSibling(c.StateFile, "images")

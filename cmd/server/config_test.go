@@ -207,3 +207,95 @@ func TestMaskKey(t *testing.T) {
 		t.Fatalf("密钥没脱敏: %q", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 生图默认返回 url
+
+// TestImageDefaultsToURL 守「默认就回 url」这条产品口径。
+//
+// 上游只回 base64，一张 4K 图 8MB+，直接丢给客户端/工作流很难用。
+// 所以 return_url 默认开、默认形态 url。
+func TestImageDefaultsToURL(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"listen":"127.0.0.1:1"}`))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if c.Images.ReturnURL == nil || !*c.Images.ReturnURL {
+		t.Fatalf("return_url 默认应为 true，得到 %v", c.Images.ReturnURL)
+	}
+	if !c.ImageURLEnabled() {
+		t.Fatal("默认应当具备 url 能力")
+	}
+	if got := c.ImageDefaultFormat(); got != "url" {
+		t.Fatalf("默认形态应当是 url，得到 %q", got)
+	}
+	if got := c.ImageMaxTotalMB(); got != 2048 {
+		t.Fatalf("落盘上限默认 2048MB，得到 %d", got)
+	}
+}
+
+// TestImageExplicitOptOut 守「显式关掉要真的关掉」：*bool 三态不能被零值吞掉。
+func TestImageExplicitOptOut(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"listen":"127.0.0.1:1","images":{"return_url":false}}`))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if c.ImageURLEnabled() {
+		t.Fatal("显式 return_url=false 之后不该再有 url 能力")
+	}
+	if got := c.ImageDefaultFormat(); got != "b64_json" {
+		t.Fatalf("没有 url 能力时必须回落 b64_json，得到 %q", got)
+	}
+
+	// response_format=url 但没有 url 能力：不该假装能给，同样回落 b64。
+	c2, err := ParseConfig([]byte(`{"listen":"127.0.0.1:1","images":{"return_url":false,"response_format":"url"}}`))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if got := c2.ImageDefaultFormat(); got != "b64_json" {
+		t.Fatalf("没有 url 能力时 response_format=url 也应回落，得到 %q", got)
+	}
+}
+
+func TestImageResponseFormatValues(t *testing.T) {
+	cases := map[string]string{
+		`"url"`:      "url",
+		`"b64_json"`: "b64_json",
+		`"both"`:     "both",
+		`"URL"`:      "url", // 大小写不敏感
+		`"  both "`:  "both",
+	}
+	for raw, want := range cases {
+		c, err := ParseConfig([]byte(`{"listen":"127.0.0.1:1","images":{"response_format":` + raw + `}}`))
+		if err != nil {
+			t.Fatalf("%s 解析失败: %v", raw, err)
+		}
+		if got := c.ImageDefaultFormat(); got != want {
+			t.Fatalf("response_format=%s 得到 %q，期望 %q", raw, got, want)
+		}
+	}
+
+	// 写错值必须报错：静默回落会让「配了 both 却只拿到 url」无从排查。
+	if _, err := ParseConfig([]byte(`{"listen":"127.0.0.1:1","images":{"response_format":"png"}}`)); err == nil {
+		t.Fatal("非法的 response_format 应当被拒绝")
+	}
+	// 负数上限同理（0 才是「不限制」）。
+	if _, err := ParseConfig([]byte(`{"listen":"127.0.0.1:1","images":{"max_total_mb":-1}}`)); err == nil {
+		t.Fatal("负的 max_total_mb 应当被拒绝")
+	}
+}
+
+// TestImageRestartFields 守「改了要提示重启」：这些值都是启动时注入 handler 的。
+func TestImageRestartFields(t *testing.T) {
+	a, _ := ParseConfig([]byte(`{"listen":"127.0.0.1:1"}`))
+	b, _ := ParseConfig([]byte(`{"listen":"127.0.0.1:1","images":{"response_format":"both","return_url":false,"max_total_mb":10}}`))
+	got := map[string]bool{}
+	for _, f := range changedRestartFields(a, b) {
+		got[f] = true
+	}
+	for _, want := range []string{"images.return_url", "images.response_format", "images.max_total_mb"} {
+		if !got[want] {
+			t.Fatalf("改 %s 应当提示重启，实际 %v", want, got)
+		}
+	}
+}

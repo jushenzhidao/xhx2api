@@ -15,9 +15,11 @@
 - **Claude Code / Anthropic SDK** → `POST /v1/messages`（含 `count_tokens`）
 - **Codex / 新版 Agent** → `POST /v1/responses`
 - **文生图 / 图生图 / 多图（OpenAI Images）** → `POST /v1/images/generations`。
-  不带 `image` 就是纯文生图；带 `image`（data URI 或裸 base64，单张或字符串数组）
-  网关自动转 multipart 打上游 `/images/edits`。multipart 客户端也可以直接走
-  `POST /v1/images/edits`（`image` 与 `image[]` 两种字段名都收）
+  不带 `image` 就是纯文生图；带 `image` 时网关自动转 multipart 打上游 `/images/edits`。
+  `image` 三种写法都收：**单张字符串**、**字符串数组**、**`null`**（= 没有图）；
+  每个元素可以是 **data URI** 或**裸 base64**（含 URL-safe / 缺 padding 的变体）。
+  `POST /v1/images/edits` 同时收 multipart 与 JSON：multipart 下 `image` / `image[]`
+  既可以是文件，也可以是 base64 文本字段（同名重复即数组）。
 
 > 本项目与商汤科技**没有任何关系**，非官方、未获授权，仅用于**本人授权账号**在
 > 本机 / 私有环境下的协议互操作。请遵守上游服务条款：**不要**用于对外中转、批量
@@ -46,8 +48,8 @@
 | 能力 | 上游端点 | 说明 |
 |---|---|---|
 | 对话 | `POST {llm}/chat/completions` | 标准 OpenAI 形状；SSE 是 `data:` 帧 |
-| 生图 | `POST {llm}/images/gen` | OpenAI Images 形状：`{prompt, size, quality}` → `data[0].b64_json`。实测 20-200s，**忽略 `model`**（只有一条通道），目录里不列图片模型。**收到 `image` 会静默忽略**（实测 image_tokens=0、出无关新图）——图生图只能走 edits |
-| 图生图 | `POST {llm}/images/edits` | 只吃 `multipart/form-data`（传 JSON 回 415）。`image` 可重复或写成 `image[]`，**多图可用**（两张图 input image_tokens=2048）。实测换风格保留构图、双图合成可用 |
+| 生图 | `POST {llm}/images/gen` | OpenAI Images 形状：`{prompt, size, quality}` → `data[0].b64_json`（**网关补 url**）。实测 20-200s，**忽略 `model`**（只有一条通道），目录里不列图片模型。**收到 `image` 会静默忽略**（实测 image_tokens=0、出无关新图）——图生图只能走 edits |
+| 图生图 | `POST {llm}/images/edits` | 上游只吃 `multipart/form-data`（直接传 JSON 回 415，网关会替你转）。`image` 可重复或写成 `image[]`，**多图可用**（两张图 input image_tokens=2048）。实测换风格保留构图、双图合成可用 |
 | 模型目录 | `GET {llm}/model_catalog` | `data.categories[].models[]`。`visible:false` 只表示「不在官网选择器里」，**不代表不可调用**：实测 3 个 `raccoon-*` 全是 false，其中就有默认模型 |
 | 续期 | `POST {auth}/refresh` | 回 `data.access_token` / `refresh_token`（轮换） |
 | 用户资料 | `GET {auth}/user_info` | `data.id` / `name` |
@@ -274,9 +276,11 @@ wire_api = "responses"
 | `images.model` | 空 | 指定上游图片模型；空 = 上游默认组 `raccoon-image-gen`。**实测上游忽略这个字段** |
 | `images.aliases` | `gpt-image-1/1-mini/2/2.5`、`dall-e-2/3` | 额外接受并暴露的图片模型名（热改生效）。上游只有一条生图通道，别名不改实际模型，纯粹方便客户端选中；`[]` = 全关 |
 | `images.timeout_seconds` | `600` | 单张图超时。实测 1024 档 49-143s、4K 档 150s，但超限尺寸压缩后单次能到 **267s**（300s 只剩 33 秒余量），故 600 |
-| `images.return_url` | `false` | 响应里额外给一个可直接访问的 `url`（图落盘或传对象存储）。显式要 `response_format=url` 时只回 url、不回 base64（省掉几 MB） |
+| `images.response_format` | `url` | 客户端**没传** `response_format`（或传 `null` / `None`）时的默认形态：`url` 只回链接、`b64_json` 只回 base64、`both` 两个都给。改了要重启 |
+| `images.return_url` | `true` | 是否提供可访问的 `url`（图落盘或传对象存储，`/v1/images/<id>`）。显式 `false` 后只能回 base64，点名要 url 会 400。改了要重启 |
+| `images.max_total_mb` | `2048` | 落盘目录总量上限；`0` = 不限制。超限按 mtime 删最旧的到 90%（旧链接会 404）。改了要重启 |
 | `images.public_base` | 空 | 写进 url 的对外基址（如 `https://xhx2api.1task.cn`）。反代后面不填会生成内网地址 |
-| `images.dir` | 空 | 落盘目录（空 = `<state 同目录>/images`）；没开 `return_url` 时不落盘 |
+| `images.dir` | 空 | 落盘目录（空 = `<state 同目录>/images`）；`return_url=false` 且没接 COS 时不落盘 |
 | `images.cos.*` | 关闭 | 传腾讯云 COS，url 用 COS 地址。字段：`secret_id` / `secret_key` / `bucket`（含 APPID）/ `region` / `prefix` / `base_url`（CDN 域名）/ `public_read`（带 `x-cos-acl: public-read`）/ `signed_ttl_seconds`（>0 时给临时签名链接）。开了自动启用 `return_url`；**上传失败回落本地盘**，不影响出图 |
 | `models.hidden` | `[]` | 黑名单：不列出 + 点名拒绝 |
 | `models.include_upstream_hidden` | `true` | `/v1/models` 也列出上游 `visible=false` 的模型。关掉则只列它官网展示的（需重启） |
@@ -439,9 +443,14 @@ wire_api = "responses"
 上游有独立生图端点，返回 **OpenAI Images 形状**，网关做的是「选号 + 透传 + 计量」：
 
 ```bash
+# 默认就回 url（网关落盘 + /v1/images/<id>）
 curl -s http://127.0.0.1:7867/v1/images/generations \
   -H "Authorization: Bearer $API_KEY" -H 'Content-Type: application/json' \
   -d '{"prompt":"一只戴帽子的橘猫，扁平插画风格","size":"1024x1024","quality":"high"}' \
+  | jq -r '.data[0].url'
+
+# 要 base64 就显式说（此时不落盘）
+curl -s ... -d '{"prompt":"...","response_format":"b64_json"}' \
   | jq -r '.data[0].b64_json' | base64 -d > cat.png
 ```
 
@@ -455,7 +464,7 @@ curl -s http://127.0.0.1:7867/v1/images/generations \
 | `quality` | **生效**，省略时默认 **`low`**：4K 档 `high` 把 `image_tokens` 从 371 拉到 13342（36 倍），1024 档从 229 到 7050 |
 | `size` 省略 | 上游默认 **`1254x1254`**（229 tokens）——不是 1024 |
 | `size=auto` | 上游认这个值，但给的是 **`1024x1024`**（196 tokens），和不传**不一样** |
-| 返回 | `data[0].b64_json`（PNG），**没有 `url`**；带 `usage.total_tokens` |
+| 返回 | 网关默认给 `data[0].url`（图落盘/传 COS，`/v1/images/<id>`）；显式 `response_format=b64_json` 时给 `b64_json`。都带 `usage.total_tokens`。上游本身只回 `b64_json`，`url` 是网关补的 |
 | 耗时 | 20-200s（比对话慢一个数量级）：1024 档 20-80s，4K 档 136-148s，`quality` 对耗时影响很小 |
 | 计费 | 实测**不扣积分**：十几次生成（含 4K、high 档）前后余额一分未动，**积分流水里没有任何生图条目**。可能限免或未接计费，别当承诺 |
 
@@ -507,8 +516,12 @@ gpt-image-1  gpt-image-1-mini  gpt-image-2  gpt-image-2.5  dall-e-2  dall-e-3
 - **不转发客户端的 `model`**：改名和透传都没有意义（上游根本不读），而且传
   `dall-e-3` 这类名字曾让 LiteLLM 报 `No fallback model group found`。想指定具体
   图片模型用 `images.model`。
-- **不支持 `response_format=url`**：上游只回 base64，没有可访问 URL。假装支持会让
-  客户端拿到 `null` 而不是图，所以直接 400 说清楚。
+- **默认返回 url，而不是 base64**：上游只回 base64（一张 4K 图 8MB+），所以网关
+  自己把图落盘/传对象存储并提供 `/v1/images/<id>`。**不传 `response_format`
+  （或传 `null` / `None`）就回 `url`**，且不再附 `b64_json`；要 base64 就显式传
+  `response_format=b64_json`（此时完全不落盘）；想两者都要把
+  `images.response_format` 设成 `both`。落盘失败/没有存储时自动回落 base64，
+  并在响应头给 `X-XHX-Image-URL: unavailable`——绝不返回 `url: null`。
 - **超时不换号**：等满一个窗口已经 100 秒，再换号继续等没有意义；5xx / 限流才换。
 
 生图会抢账号容量：实测「生图 + `raccoon-8c4485` 对话」并发时，对话侧 180s 超时。
@@ -562,8 +575,11 @@ gpt-image-1  gpt-image-1-mini  gpt-image-2  gpt-image-2.5  dall-e-2  dall-e-3
 | 图生图 JSON data URI | 200 | 49.1s | 1024x1024 | 1024×1024 | 283KB | 1232 |
 | 图生图 JSON 多图（2 张） | 200 | 234.0s | 1024x1024 | 1024×1024 | 699KB | 2258 |
 
-负向校验（全部 400 且 `error.code` 正确）：`response_format=url`、空 prompt、
-`mask` 不带 `image`、`image` 传外链 URL。
+负向校验（全部 400 且 `error.code` 正确）：空 prompt、`mask` 不带 `image`、
+`image` 传外链 URL、`response_format=png`（非法值）。
+
+> 这一轮跑的时候 `response_format=url` 还是「400 说清楚」；现在默认就回 url，
+> 那条用例已改成「不传 → 拿到 url」的正向断言（`TestImageDefaultsToURL`）。
 
 三个值得注意的点：
 

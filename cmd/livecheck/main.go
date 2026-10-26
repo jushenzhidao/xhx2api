@@ -562,11 +562,15 @@ func truncate(s string, n int) string {
 	return string(r[:n]) + "…"
 }
 
-// checkImage 验证 /v1/images/generations：要拿到真的 PNG（b64 解出来有魔数），
-// 且响应里带 usage。生图慢，所以单独给 5 分钟超时，不共用对话的 120s。
+// checkImage 验证 /v1/images/generations：要拿到真的 PNG，且响应里带 usage。
+// 生图慢，所以单独给 5 分钟超时，不共用对话的 120s。
 //
 // 请求里故意填 dall-e-3：它是个「客户端别名」（上游实测忽略 model，网关也不转发），
 // 顺便验证别名能被接受而不是 400。
+//
+// 默认形态是 url（网关把图落盘并给 /v1/images/<id>），所以这里两种都认：
+// 有 url 就去下载再验魔数——那条路顺便把静态路由和落盘一起验了；
+// 只有 base64 时（关掉 return_url，或客户端显式要 b64_json）解出来验。
 func (c *checker) checkImage() result {
 	const prompt = "一个纯色圆形，扁平图标风格"
 	body := map[string]any{"model": "dall-e-3", "prompt": prompt, "size": "1024x1024"}
@@ -594,6 +598,7 @@ func (c *checker) checkImage() result {
 	var out struct {
 		Data []struct {
 			B64 string `json:"b64_json"`
+			URL string `json:"url"`
 		} `json:"data"`
 		Size  string         `json:"size"`
 		Usage map[string]any `json:"usage"`
@@ -601,12 +606,28 @@ func (c *checker) checkImage() result {
 	if err := json.Unmarshal(payload, &out); err != nil {
 		return result{name: "生图", detail: "响应不是 JSON: " + truncate(string(payload), 120), elapsed: elapsed}
 	}
-	if len(out.Data) == 0 || out.Data[0].B64 == "" {
-		return result{name: "生图", detail: "没有返回 b64_json", elapsed: elapsed}
+	if len(out.Data) == 0 {
+		return result{name: "生图", detail: "data 为空", elapsed: elapsed}
 	}
-	png, err := base64.StdEncoding.DecodeString(out.Data[0].B64)
-	if err != nil {
-		return result{name: "生图", detail: "base64 解不开: " + err.Error(), elapsed: elapsed}
+	item := out.Data[0]
+	shape := "b64_json"
+	var png []byte
+	switch {
+	case item.URL != "":
+		shape = "url"
+		img, ierr := fetchImage(item.URL)
+		if ierr != nil {
+			return result{name: "生图", detail: "下载 url 失败: " + ierr.Error(), elapsed: elapsed}
+		}
+		png = img
+	case item.B64 != "":
+		blob, derr := base64.StdEncoding.DecodeString(item.B64)
+		if derr != nil {
+			return result{name: "生图", detail: "base64 解不开: " + derr.Error(), elapsed: elapsed}
+		}
+		png = blob
+	default:
+		return result{name: "生图", detail: "既没有 url 也没有 b64_json", elapsed: elapsed}
 	}
 	if len(png) < 8 || string(png[1:4]) != "PNG" {
 		return result{name: "生图", detail: "返回的不是 PNG（魔数不对）", elapsed: elapsed}
@@ -615,12 +636,27 @@ func (c *checker) checkImage() result {
 	return result{
 		name:    "生图",
 		ok:      true,
-		detail:  fmt.Sprintf("%s · %.0fKB · %d tokens", out.Size, float64(len(png))/1024, int64(total)),
+		detail:  fmt.Sprintf("%s · %.0fKB · %d tokens · %s", out.Size, float64(len(png))/1024, int64(total), shape),
 		elapsed: elapsed,
 	}
 }
 
-// checkAllModels 逐个模型发一句「只回复两个字」，验证可用性并记录耗时/思考开销。
+// fetchImage 下载网关给的图片地址（静态路由不带鉴权，浏览器/下载器都这么用）。
+func fetchImage(url string) ([]byte, error) {
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	// 4K PNG 约 5MB，留一点余量即可；避免被异常响应喂爆内存。
+	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+}
+
+// checkAllModels 逐个模型发一句「只回复两个字」，验证可用性并记录耗时/思考开销。// checkAllModels 逐个模型发一句「只回复两个字」，验证可用性并记录耗时/思考开销。
 //
 // 为什么值得单独跑：上游目录会变，而且「能列出来」不等于「能调用」。
 // 实测 sn-* 全是思考型（一句「收到」也要烧 100-200 个思考 token），

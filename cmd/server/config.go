@@ -167,13 +167,27 @@ type Config struct {
 		// 实测 1024 档 49-143s、4K 档 150s，但超限尺寸被压缩后单次能到 267s
 		// （2026-10-26 线上全形态验收），300s 的余量只剩 33 秒，故放到 600。
 		TimeoutSeconds int `json:"timeout_seconds"`
-		// ReturnURL 让图片响应额外带一个可直接访问的 url（图落盘，默认关）。
+		// ReturnURL 控制是否提供可直接访问的图片 url（默认**开**）。
 		//
 		// 上游只回 base64（实测传 response_format=url 也照样返回 url:null），
 		// 而一张 4K 图的 base64 有 8MB+，塞给前端、工作流或消息队列都很难用。
-		// 开启后：默认响应 = b64_json + url；客户端显式要 response_format=url
-		// 时只回 url（省带宽）。关着的时候要 url 会被 400 并提示怎么开。
-		ReturnURL bool `json:"return_url"`
+		// 所以网关默认把图落盘（或传对象存储）并提供 /v1/images/<id>。
+		// 显式 false 关掉：响应只回 base64，客户端点名要 url 会被 400。
+		ReturnURL *bool `json:"return_url"`
+		// ResponseFormat 是客户端**没传** response_format 时的默认形态：
+		//
+		//	"url"（默认）—— 只回 url，省掉几 MB base64；
+		//	"b64_json"    —— 只回 base64（旧行为，给只认 b64 的客户端）；
+		//	"both"        —— url 与 b64_json 都给。
+		//
+		// 客户端显式传 response_format 时以它为准（只接受 url / b64_json）。
+		ResponseFormat string `json:"response_format"`
+		// MaxTotalMB 是落盘目录的总量上限（省略 = 2048；0 = 不限制）。
+		//
+		// 默认可访问 url 就意味着每张图都落盘：4K PNG 单张 5MB，不设上限迟早撑满磁盘。
+		// 超过上限后按 mtime 从旧到新删，降到 90% 为止——文件名是内容哈希，
+		// 删掉的旧链接会 404，别把这里当永久存储。
+		MaxTotalMB *int `json:"max_total_mb"`
 		// PublicBase 是写进 url 的对外基址（如 https://xhx2api.1task.cn）。
 		// 空 = 按请求的 Host 推导；反向代理场景建议显式填，否则拿到的是内网地址。
 		PublicBase string `json:"public_base"`
@@ -243,6 +257,8 @@ type Config struct {
 // defaults 返回推荐默认值（与 config.example.json 一致）。
 // boolPtr 返回指向 v 的指针（用于 config 里的「未设置」三态 bool）。
 func boolPtr(v bool) *bool { return &v }
+
+func intPtr(v int) *int { return &v }
 
 func defaults() *Config {
 	c := &Config{
@@ -393,6 +409,17 @@ func applyDefaults(c *Config) {
 	if c.Images.TimeoutSeconds <= 0 {
 		c.Images.TimeoutSeconds = 600
 	}
+	if c.Images.ReturnURL == nil {
+		c.Images.ReturnURL = boolPtr(true)
+	}
+	if f := strings.ToLower(strings.TrimSpace(c.Images.ResponseFormat)); f == "" {
+		c.Images.ResponseFormat = "url"
+	} else {
+		c.Images.ResponseFormat = f
+	}
+	if c.Images.MaxTotalMB == nil {
+		c.Images.MaxTotalMB = intPtr(2048)
+	}
 	if c.DefaultModel == "" {
 		c.DefaultModel = d.DefaultModel
 	}
@@ -496,6 +523,17 @@ func applyDefaults(c *Config) {
 
 // validate 校验必填项与格式。
 func (c *Config) validate() error {
+	// 生图的默认响应形态：写错值必须报错，不能静默回落——
+	// 用户以为配了 both，实际拿到 url，排查起来毫无头绪。
+	switch c.Images.ResponseFormat {
+	case "", "url", "b64_json", "both":
+	default:
+		return fmt.Errorf(`images.response_format 只能是 "url" / "b64_json" / "both"，得到 %q`, c.Images.ResponseFormat)
+	}
+	if c.Images.MaxTotalMB != nil && *c.Images.MaxTotalMB < 0 {
+		return fmt.Errorf("images.max_total_mb 不能为负（0 = 不限制）")
+	}
+
 	if !strings.Contains(c.Listen, ":") {
 		return fmt.Errorf("listen 必须是 host:port 形式（当前 %q）", c.Listen)
 	}
@@ -569,6 +607,44 @@ func applyEnv(c *Config) {
 }
 
 // computeDerived 把字符串时长解析成 Duration（解析失败已在 validate 拦过）。
+// ImageURLEnabled 表示是否具备「给得出 url」的能力：return_url 默认开，
+// 对象存储启用时也一定具备（那条链路本来就会返回外链）。
+func (c *Config) ImageURLEnabled() bool {
+	return c.Images.COS.Enabled || c.Images.ReturnURL == nil || *c.Images.ReturnURL
+}
+
+// ImageDefaultFormat 归一「客户端没传 response_format」时的形态。
+//
+// 没有 url 能力时一律回落 b64_json：与其回一个 url:null 让客户端拿到空值，
+// 不如老实给 base64。写错的值也会回落到 url（validate 会先拦）。
+func (c *Config) ImageDefaultFormat() string {
+	switch strings.ToLower(strings.TrimSpace(c.Images.ResponseFormat)) {
+	case "b64_json":
+		return "b64_json"
+	case "both":
+		if c.ImageURLEnabled() {
+			return "both"
+		}
+		return "b64_json"
+	default: // "url"（默认）
+		if c.ImageURLEnabled() {
+			return "url"
+		}
+		return "b64_json"
+	}
+}
+
+// ImageMaxTotalMB 取图片目录上限（0 = 不限制）。
+func (c *Config) ImageMaxTotalMB() int {
+	if c.Images.MaxTotalMB == nil {
+		return 2048
+	}
+	if *c.Images.MaxTotalMB > 0 {
+		return *c.Images.MaxTotalMB
+	}
+	return 0
+}
+
 func (c *Config) computeDerived() {
 	parse := func(s string) time.Duration {
 		d, _ := time.ParseDuration(s)
@@ -702,6 +778,11 @@ func changedRestartFields(oldCfg, newCfg *Config) []string {
 		{"models.include_upstream_hidden", optionalBool(oldCfg.Models.IncludeUpstreamHidden), optionalBool(newCfg.Models.IncludeUpstreamHidden)},
 		{"images.enabled", optionalBool(oldCfg.Images.Enabled), optionalBool(newCfg.Images.Enabled)},
 		{"images.timeout_seconds", itoa(oldCfg.Images.TimeoutSeconds), itoa(newCfg.Images.TimeoutSeconds)},
+		{"images.return_url", optionalBool(oldCfg.Images.ReturnURL), optionalBool(newCfg.Images.ReturnURL)},
+		{"images.response_format", oldCfg.ImageDefaultFormat(), newCfg.ImageDefaultFormat()},
+		{"images.max_total_mb", itoa(oldCfg.ImageMaxTotalMB()), itoa(newCfg.ImageMaxTotalMB())},
+		{"images.dir", oldCfg.Images.Dir, newCfg.Images.Dir},
+		{"images.public_base", oldCfg.Images.PublicBase, newCfg.Images.PublicBase},
 	}
 	changed := map[string]bool{}
 	for _, v := range values {
@@ -766,6 +847,9 @@ func restartRequiredFields(c *Config) []string {
 		// 只影响 /v1/models 的返回内容，但它是启动时注入 handler 的。
 		"models.include_upstream_hidden",
 		"images.enabled", "images.timeout_seconds",
+		// 下面几个都是启动时注入 handler 的（url 能力、默认形态、落盘目录、对外基址）。
+		"images.return_url", "images.response_format", "images.max_total_mb",
+		"images.dir", "images.public_base",
 	}
 }
 

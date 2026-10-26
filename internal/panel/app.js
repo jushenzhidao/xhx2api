@@ -524,7 +524,8 @@
             <div class="mc-price"><span class="tag ok">生图</span></div>
           </div>
           <div class="mc-desc">文生图 / 图生图通道：<code>POST /v1/images/generations</code>，
-            返回 <code>b64_json</code>。实测 20-200s，不扣积分（不保证长期）。
+            默认返回 <code>url</code>（不传 response_format 就是 url；要 base64 传 <code>b64_json</code>）。
+            实测 20-200s，不扣积分（不保证长期）。
             上游只有这一个模型组——<b>model 字段不参与路由</b>，真正生效的是 size 与 quality。</div>
           ${aliases.length ? `<div class="mc-aliases"><span class="hint">客户端别名</span>${aliases.map((a) =>
             `<button class="tag alias" data-copy="${esc(a)}">${esc(a)}</button>`).join("")}</div>` : ""}
@@ -674,9 +675,21 @@
           hint: "一行一个，默认 gpt-image-1 / gpt-image-1-mini / gpt-image-2 / gpt-image-2.5 / dall-e-2 / dall-e-3。"
             + "实测上游生图忽略 model，别名只是让客户端能选中；留空 = 用默认表，要彻底禁用请到 JSON 视图写 []",
         },
-        { path: "images.return_url", label: "返回可访问 url", type: "bool", hint: "图落盘并提供 /v1/images/<id>" },
-        { path: "images.public_base", label: "url 对外基址", hint: "线上填 https://你的域名" },
-        { path: "images.dir", label: "图片落盘目录", hint: "空 = state 同目录 images/" },
+        {
+          path: "images.response_format", label: "默认返回形态", type: "select", restart: true,
+          options: [["url", "url（只回链接，默认）"], ["b64_json", "b64_json（只回 base64）"], ["both", "both（链接 + base64）"]],
+          hint: "客户端没传 response_format（或传 null/None）时用这个；显式传了以客户端为准",
+        },
+        {
+          path: "images.return_url", label: "提供可访问 url", type: "bool", defaultTrue: true, restart: true,
+          hint: "默认开：图落盘/传对象存储并提供 /v1/images/<id>。关掉后只能回 base64，点名要 url 会 400",
+        },
+        { path: "images.public_base", label: "url 对外基址", restart: true, hint: "线上填 https://你的域名；空 = 按请求 Host 推导" },
+        { path: "images.dir", label: "图片落盘目录", restart: true, hint: "空 = state 同目录 images/" },
+        {
+          path: "images.max_total_mb", label: "图片目录上限（MB）", type: "number", restart: true, omitIfEmpty: true,
+          hint: "默认 2048，0 = 不限制。超限按修改时间删最旧的（旧链接会 404）",
+        },
       ],
     },
     {
@@ -758,7 +771,12 @@
       const type = el.dataset.type;
       let v;
       if (type === "bool") v = el.checked;
-      else if (type === "number") v = el.value === "" ? 0 : Number(el.value);
+      else if (type === "number") {
+        // omitIfEmpty 的数字字段：留空表示「用默认值」，不能当成 0 下发。
+        // max_total_mb 的 0 是「不限制」，空值当 0 会静默取消上限。
+        if (el.value === "" && CONFIG_FIELDS[path] && CONFIG_FIELDS[path].omitIfEmpty) return;
+        v = el.value === "" ? 0 : Number(el.value);
+      }
       else if (type === "list") {
         v = el.value.split(",").map((x) => x.trim()).filter(Boolean).map((x) => (isNaN(Number(x)) ? x : Number(x)));
       } else if (type === "lines") {

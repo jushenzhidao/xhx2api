@@ -94,7 +94,9 @@
     "enabled": true,
     "model": "",
     "timeout_seconds": 600,
-    "return_url": false,
+    "response_format": "url",
+    "return_url": true,
+    "max_total_mb": 2048,
     "public_base": "",
     "dir": "",
     "cos": {
