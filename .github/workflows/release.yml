@@ -125,7 +125,10 @@ jobs:
               -o "dist/${name}${ext}" ./cmd/server
             (cd dist && if [ "$goos" = "windows" ]; then zip -q "${name}.zip" "${name}${ext}"; else tar czf "${name}.tar.gz" "${name}"; fi)
           done
-          rm -f dist/xhx2api_*_*_* 2>/dev/null || true
+          # 只删裸二进制，保留 .tar.gz/.zip。
+          # 🔴 别写成 rm -f dist/xhx2api_*_*_*：glob 的 * 能跨过点号，
+          # 会把压缩包一起删掉 —— v0.1.0 实测踩过，Release 附件为空。
+          find dist -maxdepth 1 -type f ! -name '*.tar.gz' ! -name '*.zip' -delete
           ls -lh dist
 
       # tag 在镜像构建之后：先出二进制再承诺版本，构建失败不会留下「有 tag 没产物」。
