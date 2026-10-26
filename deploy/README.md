@@ -1,6 +1,10 @@
 # 线上部署（1task.cn）
 
-目标形态：`https://xhx2api.1task.cn` → nginx（TLS）→ `127.0.0.1:7867` 容器。
+**已上线**：https://xhx2api.1task.cn（ai-prod = 210.121.44.245，`/opt/xhx2api`，
+容器 `ghcr.io/rsfree/xhx2api:sha-<提交>`，端口 `127.0.0.1:39026`）。
+运维手册见 `deploy/ai-prod/README.md`。
+
+目标形态：`https://xhx2api.1task.cn` → nginx（TLS）→ `127.0.0.1:39026` 容器。
 
 ## 1. 配置
 
@@ -39,7 +43,7 @@ docker compose -f deploy/docker-compose.yml up -d --build
 docker compose -f deploy/docker-compose.yml logs -f
 ```
 
-看到 `已启动：监听 127.0.0.1:7867` 即可。
+看到 `已启动：监听 127.0.0.1:7867` 即可（容器内 7867，ai-prod 宿主映射到 39026）。
 
 > 挂载目录属主不对会报 `permission denied`（写 `auths/*.json.tmp` 失败）：
 > `PUID=$(id -u) PGID=$(id -g) docker compose -f deploy/docker-compose.yml up -d`
@@ -47,15 +51,33 @@ docker compose -f deploy/docker-compose.yml logs -f
 
 ## 3. nginx + 证书
 
-```bash
-cp deploy/nginx.xhx2api.1task.cn.conf /www/server/panel/vhost/nginx/
-# 证书（DNS-01，不占用 80 端口）
-acme.sh --issue --dns dns_ali -d xhx2api.1task.cn
-nginx -t && nginx -s reload
+生产（ai-prod）的完整部署资产在 **`deploy/ai-prod/`**，照那个目录走即可：
+
+```
+deploy/ai-prod/
+├── docker-compose.yml          # 镜像部署（端口只绑 127.0.0.1:39026）
+├── nginx/
+│   ├── xhx2api.1task.cn.conf       # :80，只留 ACME 挑战 + 301
+│   ├── xhx2api.1task.cn-ssl.conf   # :443，include 下面的 .inc
+│   ├── xhx2api-proxy.inc           # 反代参数（SSE 不缓冲 + 长超时）
+│   └── apply-https.sh              # 幂等：DNS 预检 → 签证书 → 投 :443 → 验证矩阵
+└── README.md                   # 运维手册（升级/回滚/备份）
 ```
 
-`proxy_buffering off` 和 `proxy_read_timeout 3600s` 是**必须**的：
-思考型模型单次生成 1-3 分钟，缓冲/短超时会让客户端看起来卡死。
+```bash
+# 在目标机上（root）
+cp /opt/xhx2api/nginx/xhx2api.1task.cn.conf /www/server/panel/vhost/nginx/
+nginx -t && nginx -s reload          # 先让 :80 通，ACME 才有通道
+bash /opt/xhx2api/nginx/apply-https.sh
+```
+
+证书走 **HTTP-01 webroot**（`/www/wwwroot/acme`），不是 DNS-01 —— 域名已指向本机，
+HTTP-01 不需要阿里云 AK 参与，续期也少一个失败点。acme.sh 的 `reloadcmd` 已配 nginx reload。
+
+🔴 `proxy_buffering off` 和 `proxy_read_timeout 3600s` 是**必须**的，两个都踩过：
+- 开缓冲 ⇒ SSE 攒够才吐，客户端表现为「一直等、最后一次性出来」；
+- 默认 60s 超时 ⇒ 非流式对话实测能到 137s、生图 4K 档 148s，全部被掐断，
+  用户看到的是「网关偶尔卡死」，而不是超时错误。
 
 ## 4. 验收
 
