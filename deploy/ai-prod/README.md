@@ -11,7 +11,8 @@
 ├── .env                   # XHX2API_IMAGE_TAG=sha-<提交>
 ├── config.json            # 生产配置（含 api_key，600，属主 10001）
 ├── auths/                 # 账号凭证（JWT/refresh，700，属主 10001）
-├── data/                  # 池状态 state.json + 用量 + 请求日志 + 模型目录缓存
+├── data/                  # 池状态 + 用量 + 请求日志 + 模型目录缓存
+│   └── images/            # 生成的图（默认返回 url 后每张都落盘，600/属主 10001）
 └── nginx/                 # 站点配置与签发脚本（真源在仓库 deploy/）
 ```
 
@@ -57,10 +58,28 @@ acme.sh 自动续期，`reloadcmd` 已配。到期前 30 天会自动续，无�
 
 ## 备份
 
-只这两处是**有状态**的，升级/迁移前先备份：
+`auths` 与 `data` 是**有状态**的，升级/迁移前先备份。注意 `data/images` 可能有几个 GB
+（默认上限 2GB），只想留状态就别把图打包进去：
 
 ```bash
-tar czf /root/xhx2api-backup-$(date +%F).tar.gz -C /opt/xhx2api auths data config.json
+tar czf /root/xhx2api-backup-$(date +%F).tar.gz -C /opt/xhx2api auths config.json \
+  --exclude='data/images' data
+```
+
+## 图片目录（默认开）
+
+`images.return_url` 默认 **true**：每张生成的图都会落盘到 `data/images/`，并提供
+`https://xhx2api.1task.cn/v1/images/<sha256前16位>.<ext>`。要点：
+
+- 文件名是**内容哈希**，同一张图不会重复落盘；
+- 容量上限 `images.max_total_mb`（默认 2048，`0` = 不限）：超了按 mtime 删最旧的到 90%，
+  **旧链接会 404**，别当永久存储；
+- 想彻底不落盘：`images.return_url=false` + `images.response_format=b64_json`
+  （改了要重启，重启后用 `docker exec xhx2api sh -c 'touch /app/data/images/.w'` 验可写）；
+- 目录属主必须 10001，否则容器写不进去 → 响应会回落成 base64（`X-XHX-Image-URL: unavailable`）：
+
+```bash
+chown -R 10001:10001 /opt/xhx2api/data && chmod 755 /opt/xhx2api/data/images
 ```
 
 ## 注意
