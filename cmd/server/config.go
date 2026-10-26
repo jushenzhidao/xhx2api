@@ -163,7 +163,9 @@ type Config struct {
 		// 实测 fallback 组里有 raccoon-4eb26a / raccoon-0c119c / raccoon-ecc5fd，
 		// 但只有默认组是稳定入口，除非你确知要哪一个，否则留空。
 		Model string `json:"model"`
-		// TimeoutSeconds 单张图超时（默认 300）。实测 20-200s、high 档 158s。
+		// TimeoutSeconds 单张图超时（默认 600）。
+		// 实测 1024 档 49-143s、4K 档 150s，但超限尺寸被压缩后单次能到 267s
+		// （2026-10-26 线上全形态验收），300s 的余量只剩 33 秒，故放到 600。
 		TimeoutSeconds int `json:"timeout_seconds"`
 		// ReturnURL 让图片响应额外带一个可直接访问的 url（图落盘，默认关）。
 		//
@@ -389,7 +391,7 @@ func applyDefaults(c *Config) {
 		c.Images.Enabled = boolPtr(true)
 	}
 	if c.Images.TimeoutSeconds <= 0 {
-		c.Images.TimeoutSeconds = 300
+		c.Images.TimeoutSeconds = 600
 	}
 	if c.DefaultModel == "" {
 		c.DefaultModel = d.DefaultModel

@@ -667,7 +667,7 @@
         // 这一组的默认值都在代码里，配置里没有对应键时表单必须显示「默认的样子」，
         // 否则用户什么都没改、一保存就把生图关掉了（undefined 当 false 是最常见的坑）。
         { path: "images.enabled", label: "开启生图通道", type: "bool", defaultTrue: true, restart: true, hint: "默认开；关掉后 /v1/images/generations 直接拒绝" },
-        { path: "images.timeout_seconds", label: "单张超时（秒）", type: "number", restart: true, hint: "实测 20-200s；4K 档 136-148s，默认 300" },
+        { path: "images.timeout_seconds", label: "单张超时（秒）", type: "number", restart: true, hint: "实测 49-267s（267s 是 4096x4096 压到 2880 那次），默认 600" },
         { path: "images.model", label: "上游图片模型", hint: "空 = 默认组 raccoon-image-gen（实测上游忽略这个字段）" },
         {
           path: "images.aliases", label: "图片模型别名", type: "lines", wide: true, omitIfEmpty: true,

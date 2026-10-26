@@ -467,7 +467,8 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, started tim
 
 		timeout := h.cfg.ImageTimeout
 		if timeout <= 0 {
-			timeout = 5 * time.Minute
+			// 兜底与 config 默认值保持一致：4K 压缩后实测能到 267s，5 分钟太紧。
+			timeout = 10 * time.Minute
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		reply, gerr := send(ctx, a)

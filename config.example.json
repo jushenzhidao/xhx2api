@@ -93,7 +93,7 @@
   "images": {
     "enabled": true,
     "model": "",
-    "timeout_seconds": 300,
+    "timeout_seconds": 600,
     "return_url": false,
     "public_base": "",
     "dir": "",

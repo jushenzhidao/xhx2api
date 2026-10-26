@@ -60,6 +60,7 @@ tag 与 `latest`（默认分支）。
 | 生图默认值 | `size` 省略 → 上游给 **1254x1254**（229 tokens）；`size=auto` → **1024x1024**（196）——两者不一样。`quality` 省略恒为 `low` | `probe_4k.py ""` / `size=auto` |
 | 生图并发 | 单账号 **10 上限**（与对话共用配额）：4 并发 4/4（167s）、8 并发 8/8（100s）、12 并发 10/12（2 个 429）。429 正文 `code 200103 limiter_request_error`、`retry after:0s`、0.1s 立即返回；**等 1s 重试 12/12 全成功** → `serveImage` 原地等 2s 重试，不换号不罚号 | `imageRateRetryDelay`、`pool.max_in_flight=10` |
 | 生图混跑 | 8 生图 + 4 对话（同账号、对话延后 1s）12 个全过 → 429 看瞬时峰值，不是严格在途计数 | `img_mixed.py` |
+| 生图全形态（线上） | 9 形态全过：文生图 1024/别名/`quality=high`/4K/超限压缩、图生图 multipart/mask/JSON 内联/多图。耗时 **49-267s**（267s 是 4096x4096 被压到 2880 后），故 `images.timeout_seconds` 默认提到 **600**。图生图确认真用输入图（蓝圆保留、方块按 prompt 由红改金）。tokens：文生图 220 / 图生图 1232 / 双图 2258 / high 7036 | `deploy/ai-prod`、`image_forms_e2e.py` |
 | 生图计费（复测） | 十几次生成（含 4K、high，400 的失败请求）前后余额**一分未动**（7815→7815 / 8912→8912），积分流水里**没有任何生图条目**（最新仍是对话 -2） | `panel` 账号余额 + `bills` |
 | 图片模型组 | LiteLLM 侧是 `raccoon-image-gen`，fallback 为 `raccoon-4eb26a`/`raccoon-0c119c`/`raccoon-ecc5fd`；**`model_catalog` 不列图片模型**，所以网关合成 `raccoon-image-gen` 暴露给客户端 | `upstream.ImageModelID`、`/v1/models` |
 | 生图别名 | `gpt-image-1/1-mini/2/2.5`、`dall-e-2/3` 默认全接受并出现在 `/v1/models`（`alias_of` 指回合成 id）；只为让硬编码这些名字的客户端能选中，不改实际模型。`images.aliases: []` 关掉（热改） | `upstream.ImageModelIDs`、`livecfg.Snapshot.ImageAliases` |
