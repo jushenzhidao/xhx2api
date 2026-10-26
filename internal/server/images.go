@@ -414,6 +414,24 @@ func buildEditMultipart(req imageRequest) ([]byte, string, error) {
 	return buf.Bytes(), mw.FormDataContentType(), nil
 }
 
+// shouldRotateImage 决定生图失败后要不要换号继续。
+//
+// 只有「客户端还在等」的类别才换：session_dead / server / gateway 是账号或
+// 上游的问题，换个号可能就成了。
+//
+// 🔴 client（499）不能换。它是调用方自己断开——换号继续生成只会白烧一次上游
+// 配额、占着账号并发额度，还会连记几个 499 把面板失败率拉高。对话路径由
+// shouldRotate 的白名单天然挡住了这一类，生图这里曾经写成黑名单并且把 client
+// 归到了「可换号」那一侧（2026-10-26 实测：客户端 20s 超时后网关换了第二个号
+// 又完整跑了一遍，两次都记 499）。
+func shouldRotateImage(kind pool.ErrKind) bool {
+	switch kind {
+	case "session_dead", "server", "gateway":
+		return true
+	}
+	return false
+}
+
 // resolveResponseFormat 决定这次响应回什么形态。
 //
 // 客户端没传（空 / null / None）时用配置的默认值（默认 url）；传了就以客户端
@@ -630,8 +648,7 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, started tim
 			}
 
 			lease.Release(&kind, gerr.Error(), elapsed)
-			// 超时不换号：等满一个窗口已经 100s 了，再换一个号继续等没有意义。
-			if kind != "client" && kind != "session_dead" && kind != "server" && kind != "gateway" {
+			if !shouldRotateImage(kind) {
 				break
 			}
 			excluded[a.UID] = true
