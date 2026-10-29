@@ -1,6 +1,7 @@
 # 运行期数据（含凭证），绝不进版本库
 auths/
 data/
+conf/
 config.json
 *.log
 

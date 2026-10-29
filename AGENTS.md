@@ -22,8 +22,19 @@ tag 与 `latest`（默认分支）。
   远高于漏判（见 `TestClassifyDoesNotBlameAccountForParams`）；
 - 错误分类只在 `upstream.Classify` 与 `classifyErrorText` 两处，别在 handler 里
   另写一份文案匹配；
+- 配置/凭证/池状态的落盘统一是「写 `.tmp` → rename」：**配置只能目录挂载**
+  （`./conf:/app/conf` + `-config /app/conf/config.json`）。挂成单文件
+  `./config.json:/app/config.json` 时，`rename` 的目标是 bind mount 的 mountpoint，
+  内核直接 `EBUSY`，面板「配置」页永远存不进去（2026-10-29 ai-prod 实测）。改挂载
+  或 `-config` 路径时三处 compose 一起改：根、`deploy/`、`deploy/ai-prod/`；
 - 面板改动后跑一次 `node --check internal/panel/app.js`，并至少手工验证
   「账号 / 模型 / 请求 / 配置」四页能渲染（无头 Chrome 即可）。
+- 配置保存有**两种语义**，别混：`SaveConfig` 走合并（表单只提交它管的键，
+  没提交的键保持磁盘旧值），`ReplaceConfig` 以提交为准（JSON 编辑器提交整份，
+  没提到的已知键就是删除）。合并语义天然「只能加不能删」，所以集合型配置段
+  （`setSectionKeys`，目前是 `aliases`）必须整段替换——否则面板里删掉一行、
+  保存后又冒出来。`?mode=replace` 由前端 JSON 视图带上；replace 模式会拒空对象、
+  且漏掉 `api_key` 时沿用旧值（否则会重新随机生成，全客户端 401）。
 
 ## 上游实测记录（改代码前先读）
 
@@ -40,11 +51,15 @@ tag 与 `latest`（默认分支）。
 | 手机号登录三件套 `send_sms` / `login_with_sms` / `user_info` | phone/password 必须 AES-128-CFB 加密（`base64(iv‖ct)`，密钥 `senseraccoon2023`）；明文 → `params_encryted_error` | `upstream.EncryptCredential`、`authapi.go` |
 | `send_sms` 的 `captcha_param` | 阿里云验证码（`scene=1pkmy0x3`/`prefix=hk1r5l`/`region=cn`），假票 → `100006 captcha_verify_error`，**绕不开**；面板 CSP 必须放行 `*.alicdn.com`，否则控件 `onError`（实测 o/g/x 三个 CDN 域名都要） | `panel.setSecurityHeaders`、`index.html#mode-sms` |
 | 两条登录通道验证码不通用 | IAM（`/api/iam/v1/sms/send` + `/auth/login/sms`）与桌面端（`/api/web/auth/v1/send_sms` + `login_with_sms`）各发各的码；**发码与验码必须同通道**，混用报 `sms_code_verify_error`（实测：用户填对了也失败） | `upstream.SendSmsCode` 的 `preferLegacy`、`panel.smsPending` |
+| 手机号登录拿到的 IAM 票是**未确认态** | 登录本身成功（有 access_token），但之后 `user_info` / `chat` 一律 HTTP 400 `{"code":200901,"message":"iam_confirm_required"}`。网页端在每个受保护请求前先 `POST /api/web/auth/v1/iam/confirm`（body `{}`，Bearer 票），拿到 `{"code":0}` 才继续；幂等，重复调用仍 code 0。不补这一步：`GetUserInfo` 会静默回落到 JWT 里的 `pu-…` 主体，账号看着导入成功、uid 是 `pu-…`、每个请求都 400（2026-10-29 真实号踩到） | `upstream.ConfirmIAM`、`LoginWithSms` 的 IAM 分支、`GetUserInfo` 的补确认重试 |
+| uid 还是 `pu-…` = 资料没取到 | office 域 uid 是纯数字；`pu-` 前缀是 IAM 主体，说明 `user_info` 没通（未确认票/票过期），别当正常账号用 | 同上 |
+| 「无续期令牌」不是坏号 | 只是没有 `refresh_token`（客户端目录 / 手机号导入的 IAM 票都只有 access_token，约 30 天）。号能正常用，到期前必须重新登录/导入 | `panel/app.js` 的 `has_refresh` 标签、`auth.Auth.RefreshToken` |
 | 邀请归因字段 `inviter_user_id` | 只有桌面端通道认；IAM body 只有四个字段，多塞会被严格校验拒 | `upstream.LoginWithSms` |
 | 邀请奖励 | **不存在**。老号流水零变化；新号只有 `新人注册礼包 3000` + `桌面端登录奖励 3000`；`/invite` 页面是组织邀请（拉人进团队），与积分无关 | — |
 | 积分来源 | 发放制，无任务、无邀请返利：新人礼 3000 + 桌面端登录 3000 + **移动端登录 3000**（都可领）+ 每日 300 | `upstream.PointAudit` |
 | 新号起始额度 | **9000 分**（注册礼 3000 自动 + 桌面端 3000 + 移动端 3000，后两笔入池即领） | `panel.claimWelcome` |
 | 移动端奖励别等签到 | 实测注册当天就能领（6000→9000）；以前只挂在签到流程里，新号要等下一个时段 | `panel.claimWelcome` |
+| 签到 `ineligible` 只能给「注册已过一天且流水从无 `daily_grant`」的号 | 新号当天 bills 里必然一条 `daily_grant` 都没有，先判「从来没有」就会把刚注册几小时的号报成 ineligible（2026-10-29 实测：手机号新号 17:07 注册、17:15 报「历史上从未获得每日积分」）。凭证里通常不带 `register_at`（裸 token / 手机号导入都没有），得用 `upstream.UserCreatedAt` 补一次并落盘；顺序必须是 今天注册→pending 先于 从无→ineligible | `scheduler.registerTime`、`scheduler.CheckinAccount`，测试 `TestCheckinTodayRegisteredIsPending` |
 | 登录类错误以 HTTP 400 + 信封 code 返回 | 不能先看状态码，否则业务码被吞，面板只剩「http 400」看不懂 | `upstream.smsCall` / `smsBusinessError` |
 | 上游 `visible:false` | 3 个 `raccoon-*` 全标 false，但可调用（默认模型 `raccoon-8c4485` 就是其中之一）。**不能按它过滤 /v1/models**，否则客户端看不到默认模型 | `server.ExcludeUpstreamHidden`（零值=全列）、`models.include_upstream_hidden` |
 | `raccoon-chat-ml-5-5` | 不在目录里，但实测 HTTP 200；默认别名 `gpt-4o`/`claude-*` 指向它。模型页把它列为「目录外」 | `panel.models` 的 `orphans` |

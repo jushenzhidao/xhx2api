@@ -80,7 +80,7 @@ origin https://xiaohuanxiong.com
 ### 二进制
 
 ```bash
-git clone https://github.com/rsfree/xhx2api && cd xhx2api
+git clone https://github.com/jushenzhidao/xhx2api && cd xhx2api
 go build -o xhx2api ./cmd/server
 ./xhx2api -config ./config.json
 ```
@@ -98,8 +98,8 @@ curl -s -H 'Authorization: Bearer <api_key>' http://127.0.0.1:7867/v1/models
 ### Docker
 
 ```bash
-cp config.example.json config.json   # 必做：缺失时挂载点会被建成目录
-mkdir -p auths data
+mkdir -p conf auths data
+cp config.example.json conf/config.json   # 也可以留空，首次启动自动生成带随机 api_key 的配置
 docker compose up -d --build
 docker compose logs -f
 ```
@@ -109,8 +109,13 @@ docker compose logs -f
 ```bash
 PUID=$(id -u) PGID=$(id -g) docker compose up -d
 # 或
-sudo chown -R 10001:10001 auths data config.json
+sudo chown -R 10001:10001 auths data conf
 ```
+
+> 🔴 配置是 `./conf:/app/conf` **目录挂载** + `-config /app/conf/config.json`。
+> 别改成 `./config.json:/app/config.json` 单文件挂载：面板保存用「写 `config.json.tmp`
+> → `rename` 覆盖」，`rename` 的目标是 bind mount 的 mountpoint 时内核返回 `EBUSY`，
+> 面板会报 `device or resource busy` 且配置存不进去。
 
 线上部署（Docker + nginx + 域名）见 [`deploy/README.md`](deploy/README.md)，里面含
 SSE 必须的 nginx 配置（`proxy_buffering off`）与回调基址设置。

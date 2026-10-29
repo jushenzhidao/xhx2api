@@ -10,9 +10,12 @@ services:
     # 容器以 uid 10001 运行。宿主机挂载目录属主不同会导致
     # 「写入 auths/*.json.tmp 失败 permission denied」，三种解法任选：
     #   1) 让容器以你自己的 uid 运行：PUID=$(id -u) PGID=$(id -g) docker compose up -d
-    #   2) sudo chown -R 10001:10001 ./auths ./data ./config.json
+    #   2) sudo chown -R 10001:10001 ./auths ./data ./conf
     #   3) user: "0:0" 以 root 运行（省事但逃逸面更大，自担）
     user: "${PUID:-10001}:${PGID:-10001}"
+    # 镜像默认 `-config /app/config.json`；这里指到目录挂载里，
+    # 否则面板「配置」页保存必然 EBUSY（rename 覆盖 mountpoint，见下）。
+    entrypoint: ["/app/xhx2api", "-config", "/app/conf/config.json"]
     environment:
       - TZ=Asia/Shanghai
       # 也可以用环境变量覆盖配置（优先级高于 config.json）：
@@ -23,7 +26,8 @@ services:
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
-      # 注意：宿主机必须先有 config.json（cp config.example.json config.json）。
-      # 缺失时 Docker 会把挂载点创建成目录，容器启动失败。
-      # 不挂 :ro：面板「配置」页要写回这个文件。
-      - ./config.json:/app/config.json
+      # 配置**必须目录挂载**，不能挂单文件：面板保存走「写 config.json.tmp → rename」，
+      # 目标若是单文件 bind mount 的 mountpoint，内核返回 EBUSY（device or resource busy），
+      # 保存永远失败。目录挂载下 config.json 只是挂载点里的普通文件，rename 合法。
+      # 目录里没有 config.json 时程序会自己生成一份带随机 api_key 的配置。
+      - ./conf:/app/conf
