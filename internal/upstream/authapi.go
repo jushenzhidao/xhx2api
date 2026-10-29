@@ -61,6 +61,14 @@ const (
 	IamSmsSendPath = "/sms/send"
 	// IamSmsLoginPath 验证码登录。
 	IamSmsLoginPath = "/auth/login/sms"
+	// IamConfirmPath 确认 IAM 会话（authBase 下的端点，不是 IamBase）。
+	//
+	// 手机号登录换出来的 IAM 票默认是「已签发、未确认」：user_info 与 chat 一律回
+	// HTTP 400 `{"code":200901,"message":"iam_confirm_required"}`，账号在池子里
+	// 看着正常，实际一次都调不通（2026-10-29 真实号踩到）。
+	// 网页端在每个受保护请求前都会先 POST 它（站点 chunk 里
+	// `fetch("/api/web/auth/v1/iam/confirm")`，body 空对象，拿到 {"code":0} 才继续）。
+	IamConfirmPath = "/iam/confirm"
 	// CredentialKey 是网页登录页内联配置里的 AES 密钥。
 	//
 	// 上游换密钥的话，改这里即可；`EncryptCredential` 会校验长度（16/24/32），
@@ -226,6 +234,12 @@ func (c *Client) LoginWithSms(ctx context.Context, nationCode, phone, code, veri
 			if access == "" {
 				return nil, &Error{Kind: ErrServer, Status: 502, Msg: "小浣熊短信登录未返回 access_token"}
 			}
+			// 不确认的 IAM 票后面每个请求都是 400 iam_confirm_required，
+			// 与其把一张废票写进池子（uid 还会停在 pu-…），不如在这里说清。
+			// 端点不存在时降级继续（老站点没有这一步）。
+			if cerr := c.ConfirmIAM(ctx, access); cerr != nil && !isEndpointMissing(cerr) {
+				return nil, fmt.Errorf("IAM 会话确认失败: %w", cerr)
+			}
 			return c.finishLogin(ctx, &auth.Auth{Data: auth.Data{
 				AccessToken: access,
 				Nickname:    text(data, "name", "nickname"),
@@ -273,6 +287,45 @@ func (c *Client) LoginWithSms(ctx context.Context, nationCode, phone, code, veri
 		UID:          auth.JWTUserID(access),
 	}}
 	return c.finishLogin(ctx, account)
+}
+
+// ConfirmIAM 把 IAM 票从「已签发」推进到「可用」。
+//
+// 幂等：已确认的票重复调用仍返回 {"code":0}（2026-10-29 实测连打三次）。
+// 上游把失败也放在 HTTP 400 + 信封 code=200901 里，所以状态码和 code 都要判。
+func (c *Client) ConfirmIAM(ctx context.Context, token string) error {
+	token = stripBearerToken(token)
+	if token == "" {
+		return &Error{Kind: ErrClient, Status: 400, Msg: "token 为空"}
+	}
+	resp, err := c.doJSON(ctx, http.MethodPost, c.authBase()+IamConfirmPath, map[string]any{},
+		map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token})
+	if err != nil {
+		return err
+	}
+	var envelope struct {
+		Code    json.Number `json:"code"`
+		Message string      `json:"message"`
+	}
+	if jerr := json.Unmarshal(resp.Body, &envelope); jerr != nil {
+		return &Error{Kind: ErrServer, Status: 502,
+			Msg: "IAM 会话确认未返回有效 JSON: " + truncate(string(resp.Body), 160)}
+	}
+	if envelope.Code.String() == "0" && resp.Status >= 200 && resp.Status < 300 {
+		return nil
+	}
+	msg := strings.TrimSpace(envelope.Message)
+	if msg == "" {
+		msg = fmt.Sprintf("IAM 会话确认失败（HTTP %d，code=%s）", resp.Status, envelope.Code.String())
+	}
+	return &Error{Kind: Classify(resp.Status, string(resp.Body)), Status: resp.Status, Msg: msg}
+}
+
+// isIAMConfirmRequired 判断错误是不是「IAM 票未确认」（上游 200901）。
+//
+// 只能在 iam/confirm 补确认；换号、重试、熔断都没意义，账号本身没坏。
+func isIAMConfirmRequired(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "iam_confirm")
 }
 
 // finishLogin 用 user_info 补齐 uid/昵称，并做最后的合法性检查。
