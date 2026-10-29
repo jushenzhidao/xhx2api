@@ -157,6 +157,71 @@ func TestMergeMapsDeep(t *testing.T) {
 	}
 }
 
+// 别名表是「集合型」段：面板里删掉一行，保存后必须消失。
+// 以前走深合并，删掉的行会被磁盘旧值补回来（「只能加不能删」）。
+func TestSaveConfigDeletesAliasEntry(t *testing.T) {
+	path := t.TempDir() + "/config.json"
+	if err := os.WriteFile(path, []byte(`{"api_key":"sk-test","aliases":{"gpt-4o":"raccoon-a","claude-3":"raccoon-b"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := SaveConfig(path, []byte(`{"api_key":"sk-test","aliases":{"gpt-4o":"raccoon-a"}}`))
+	if err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	if _, ok := next.Aliases["claude-3"]; ok {
+		t.Fatalf("删掉的别名又回来了: %v", next.Aliases)
+	}
+	if next.Aliases["gpt-4o"] != "raccoon-a" {
+		t.Fatalf("保留的别名不对: %v", next.Aliases)
+	}
+}
+
+// JSON 编辑器走 replace 语义：整份提交，没提到的已知键就是删除。
+func TestReplaceConfigDropsOmittedKeys(t *testing.T) {
+	path := t.TempDir() + "/config.json"
+	cur := `{"api_key":"sk-test","listen":":7867","cooldown":{"plan_credit":"36h"},` +
+		`"_comment":"手写说明","upstream":{"user_agent":"UA-X","_comment":"段内说明"}}`
+	if err := os.WriteFile(path, []byte(cur), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 提交里故意不带 cooldown 与 upstream.user_agent。
+	next, _, err := ReplaceConfig(path, []byte(`{"api_key":"sk-test","listen":":7867","upstream":{"timeout_seconds":30}}`))
+	if err != nil {
+		t.Fatalf("ReplaceConfig: %v", err)
+	}
+	// 删掉的段回到默认值（plan_credit 默认 12h），不是保留提交里已被删掉的 36h。
+	if next.Cooldown.PlanCredit == "36h" {
+		t.Fatalf("提交里没有的段被旧值补回来了: %q", next.Cooldown.PlanCredit)
+	}
+	if next.Upstream.UserAgent != "" {
+		t.Fatalf("提交里没有的字段应当删掉，实得 %q", next.Upstream.UserAgent)
+	}
+	rawBytes, _ := os.ReadFile(path)
+	raw := string(rawBytes)
+	// 未知键（注释）连同一层子键都要保住，否则用户的说明会被吃掉。
+	if !strings.Contains(raw, "手写说明") || !strings.Contains(raw, "段内说明") {
+		t.Fatalf("注释键被洗掉了:\n%s", raw)
+	}
+}
+
+// 手滑把 api_key 删掉不该导致全客户端 401：沿用磁盘旧值。
+func TestReplaceConfigKeepsAPIKeyWhenOmitted(t *testing.T) {
+	path := t.TempDir() + "/config.json"
+	if err := os.WriteFile(path, []byte(`{"api_key":"sk-keep-me","listen":":7867"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := ReplaceConfig(path, []byte(`{"listen":":7867"}`))
+	if err != nil {
+		t.Fatalf("ReplaceConfig: %v", err)
+	}
+	if next.APIKey != "sk-keep-me" {
+		t.Fatalf("api_key 被换掉了: %q", next.APIKey)
+	}
+	if _, _, err := ReplaceConfig(path, []byte(`{}`)); err == nil {
+		t.Fatal("空提交在整份覆盖模式下应当被拒")
+	}
+}
+
 func TestCallbackBase(t *testing.T) {
 	cases := map[string]string{
 		"0.0.0.0:7867":     "http://127.0.0.1:7867",

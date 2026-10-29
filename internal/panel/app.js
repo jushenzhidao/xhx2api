@@ -1060,6 +1060,9 @@
 
   $("#btn-config-save").addEventListener("click", async () => {
     let payload;
+    // JSON 视图里编辑的是整份配置，删掉的行必须真的删掉 ⇒ 以提交内容为准；
+    // 表单视图只提交它管的键 ⇒ 走合并，别把没用表单覆盖的键洗掉。
+    let url = "/panel/api/config";
     if (state.configView === "json") {
       try {
         payload = JSON.parse($("#config-editor").value);
@@ -1067,13 +1070,14 @@
         $("#config-msg").textContent = "JSON 语法错误：" + e.message;
         return;
       }
+      url += "?mode=replace";
     } else {
       payload = collectConfigForm();
     }
     const btn = $("#btn-config-save");
     btn.disabled = true;
     try {
-      const r = await api("/panel/api/config", { method: "POST", body: payload });
+      const r = await api(url, { method: "POST", body: payload });
       const need = (r.restart_required || []).filter(Boolean);
       $("#config-msg").textContent = need.length
         ? "已保存。以下字段需要重启进程才生效：" + need.join("、")

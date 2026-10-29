@@ -183,8 +183,12 @@ func main() {
 			}
 			return cur, nil
 		},
-		SaveConfig: func(raw []byte) ([]string, error) {
-			next, restart, err := SaveConfig(*cfgPath, raw)
+		SaveConfig: func(raw []byte, replace bool) ([]string, error) {
+			save := SaveConfig
+			if replace {
+				save = ReplaceConfig
+			}
+			next, restart, err := save(*cfgPath, raw)
 			if err != nil {
 				return nil, err
 			}
