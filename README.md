@@ -460,13 +460,14 @@ curl -s ... -d '{"prompt":"...","response_format":"b64_json"}' \
 |---|---|
 | 必填 | 只有 `prompt`（空值上游直接 400） |
 | `model` | **完全被忽略**：传 `gpt-image-2` / `gpt-image-2.5` / 甚至捏造的 `definitely-not-an-image-model-xyz` 都 200，`image_tokens` 一模一样 |
+| 实际模型 | **gpt-image-2**（OpenAI 系），与 Seedream / 商汤 U1 Pro 无关。产物 PNG 里的 C2PA 签名可自证：一部分盖 `Azure OpenAI ImageGen`（微软 invismark），一部分盖 `gpt-image-2` + `OpenAI OpCo, LLC`；少数不带签名的，其单 IDAT 编码与直连渠道同构，属于同源剥签名 |
 | `size` | **生效**，上限是「最长边 3840 + 总像素 8,294,400」：`1024x1024`→196 tokens、`1536x1024`→158、`1792x1024`→139、`3840x2160`(4K)→371。超限的两种失败模式见下 |
 | `quality` | **生效**，省略时默认 **`low`**：4K 档 `high` 把 `image_tokens` 从 371 拉到 13342（36 倍），1024 档从 229 到 7050 |
-| `size` 省略 | 上游默认 **`1254x1254`**（229 tokens）——不是 1024 |
+| `size` 省略 | 上游**自选比例**：早期实测 `1254x1254`（229 tokens），2026-10-27 复测为 `1402x1122`（186 tokens）——不要当成固定值 |
 | `size=auto` | 上游认这个值，但给的是 **`1024x1024`**（196 tokens），和不传**不一样** |
 | 返回 | 网关默认给 `data[0].url`（图落盘/传 COS，`/v1/images/<id>`）；显式 `response_format=b64_json` 时给 `b64_json`。都带 `usage.total_tokens`。上游本身只回 `b64_json`，`url` 是网关补的 |
 | 耗时 | 20-200s（比对话慢一个数量级）：1024 档 20-80s，4K 档 136-148s，`quality` 对耗时影响很小 |
-| 计费 | 实测**不扣积分**：十几次生成（含 4K、high 档）前后余额一分未动，**积分流水里没有任何生图条目**。可能限免或未接计费，别当承诺 |
+| 计费 | 实测**不扣积分**：直连上游（196 image_tokens）与经网关（213 tok）各测一次，按 `bill_id` 求差集，两个号余额与流水**均无变化**。注意别把「客户端 agent 画图」的扣费算到这里——那是 agent 的 LLM 轮次在花钱（`任务消耗 · <会话标题>`）。可能限免或未接计费，别当承诺 |
 
 `model` 那一行不是笔误：这条通道只有 LiteLLM 的 `raccoon-image-gen` 一个组，
 **没有真正的模型选择能力**。`/images/gen` 的响应体里连 `model` 字段都不回。
