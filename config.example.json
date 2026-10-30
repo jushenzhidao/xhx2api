@@ -32,8 +32,8 @@
   },
   "cooldown": {
     "plan_credit": "12h",
-    "soft_rate": "60s",
-    "soft_rate_max": "2h"
+    "soft_rate": "15s",
+    "soft_rate_max": "5m"
   },
   "pool": {
     "strategy": "round_robin",

@@ -64,17 +64,22 @@ tag 与 `latest`（默认分支）。
 | 生图并发 | 单账号 **10 上限**（与对话共用配额）：4 并发 4/4（167s）、8 并发 8/8（100s）、12 并发 10/12（2 个 429）。429 正文 `code 200103 limiter_request_error`、`retry after:0s`、0.1s 立即返回；**等 1s 重试 12/12 全成功** → `serveImage` 原地等 2s 重试，不换号不罚号 | `imageRateRetryDelay`、`pool.max_in_flight=10` |
 | 生图混跑 | 8 生图 + 4 对话（同账号、对话延后 1s）12 个全过 → 429 看瞬时峰值，不是严格在途计数 | `img_mixed.py` |
 | 生图全形态（线上） | 9 形态全过：文生图 1024/别名/`quality=high`/4K/超限压缩、图生图 multipart/mask/JSON 内联/多图。耗时 **49-267s**（267s 是 4096x4096 被压到 2880 后），故 `images.timeout_seconds` 默认提到 **600**。图生图确认真用输入图（蓝圆保留、方块按 prompt 由红改金）。tokens：文生图 220 / 图生图 1232 / 双图 2258 / high 7036 | `deploy/ai-prod`、`image_forms_e2e.py` |
-| 生图计费（复测） | 十几次生成（含 4K、high，400 的失败请求）前后余额**一分未动**（7815→7815 / 8912→8912），积分流水里**没有任何生图条目**（最新仍是对话 -2） | `panel` 账号余额 + `bills` |
+| 生图计费（2026-10-27 受控复测） | 直连上游 66.3s/196 image_tokens、经网关 49.7s/213 tok，两个号余额**与 bill_id 集合均无变化** ⇒ **生图通道本身不扣分**。但**客户端 agent 画图会扣**（`任务消耗 · <会话标题>`，实测 -2/-4/-9）：那是 agent 的 LLM 轮次在花钱，不是生图。查扣费必须按 bill_id 求差集，只看余额会把别的客户端算到自己头上 | `/tmp/billprobe.py`、`/tmp/billdirect.py` |
 | 图片模型组 | LiteLLM 侧是 `raccoon-image-gen`，fallback 为 `raccoon-4eb26a`/`raccoon-0c119c`/`raccoon-ecc5fd`；**`model_catalog` 不列图片模型**，所以网关合成 `raccoon-image-gen` 暴露给客户端 | `upstream.ImageModelID`、`/v1/models` |
 | 生图别名 | `gpt-image-1/1-mini/2/2.5`、`dall-e-2/3` 默认全接受并出现在 `/v1/models`（`alias_of` 指回合成 id）；只为让硬编码这些名字的客户端能选中，不改实际模型。`images.aliases: []` 关掉（热改） | `upstream.ImageModelIDs`、`livecfg.Snapshot.ImageAliases` |
+| **生图模型身份（C2PA 铁证）** | 上游是 **gpt-image-2**，**没有 Seedream、也没有商汤自家 U1 Pro**。19 张产物里 11 张盖章 `Azure OpenAI ImageGen`（Microsoft invismark + Microsoft SCD 证书链），5 张盖 `API` / 版本 `gpt-image-2` / `OpenAI Media Service API` / 签名主体 `OpenAI OpCo, LLC`（SSL.com C2PA ICA + OpenAI TSA 时间戳）。签名证书是厂商私钥，第三方模型伪造不了 | `data/images/*.png` 的 `caBX` 清单 |
+| 两条渠道可辨形 | `Azure OpenAI` 恒为 `caBX` + **65536 字节分块 IDAT**；`OpenAI 直连` 恒为 `caBX` + **单 IDAT**（整块 1-2MB）。**无 C2PA 的 3 张全是单 IDAT** ⇒ 同源剥了签名块、图像未转码（JPEG 8x8 网格痕迹 0.93-1.14 ≈ 无），不是第三家模型 | 同上 |
+| 生图尺寸是 OpenAI 规格 | `1536x1024`/`1024x1536` 原样返回（158 image_tokens）、`1024x1024` 196、不传 size → **1402x1122**（不再固定 1254x1254，上游自选比例）；`2048x2048` 直接 500。Seedream 的 2K/4K 固定档在这里不存在（4096² 会被压到 2880² 才是 gpt-image 的行为） | 尺寸矩阵实测 2026-10-27 |
+| C2PA 取证位置 | C2PA 在 `caBX` 块，**位置在 IDAT 之前**；只扫到 IDAT 就收工会误判成「无元数据」（踩过：把 6 张带签的图判成无签名） | 扫块要走到 `IEND` |
 | 生图耗时与容量 | 单张 20-200s；**与对话并发会抢账号容量**（实测生图 + raccoon-8c4485 并发 → 对话 180s 超时） | `images.timeout_seconds`（默认 300）、超时不换号 |
-| 生图计费 | 实测多张**不扣积分**（余额一分未动）。可能限免/未接计费，别当承诺 | — |
 | 客户端生图是「可配置 OpenAI 端点」 | 桌面端内置预设指向 `${origin}/api/web/llm/v2/images/gen`，配置项 `{type:remote, endpoint, apiKey, model, timeout}`；说明**客户端把生图当 OpenAI 兼容接口用** | `build/electron/main/client/settings/builtinServiceSettings.js` |
 | 上游并发限制 | 单账号 ≤10 并发全成功，12 起 `429 limiter_request_error`；**按账号算**（两号各 8 并发共 16 全过）。是并发限流不是 TPM | `pool.max_in_flight` 默认 10、`pool.queue_wait` 2s、`Pool.PickWait` |
 | 扫码落地页 `/login/mp` 404 | 轮询端点还在（任意 code 回 pending），二维码改由上游生成；当前实现不可用 | 面板有提示；等逆向出新路径再修 |
 | `X-RACCOON-Title` | 会写进积分流水 `event_name`（「任务消耗 · <title>」），可用来逐笔对账 | `upstream.ChatStream` |
 | 一次 16 token 对话扣 2 分 | 倍率按模型（raccoon x1 / glm-5-3 x0.75 / glm-5-3-flash x0.2） | 面板模型页展示 |
 | 限免模型 x0 | `sn-sensenova-6-8-flash` 等实测不扣积分（限免至 10-31） | 模型页标「免费」 |
+| **429 不是 IP 维度** | 同一账号从两个出口 IP（`210.121.44.245` / `117.88.13.53`）各发 6 个请求，**全部 200**；51 并发集中打时 429 率反而只有 0.6%（31–38 在途 0.6%、39–46 在途 6.3%）。限流绑**账号**，不绑 IP——别用换代理/换机解决 | 2026-10-30 实测，`/tmp/xhxprobe.py` |
+| **429 是秒级恢复的瞬时闸** | 被判「第 7 级退避、冷却 1.1h」的账号**直接打上游仍然 200**。原实现「429 → 账号级指数退避 60s→2h」把一次抖动放大成整池锁死：831 次 429 全是换号重试（attempts≥2），每次罚 2–3 个号，最终 7812 条 503（75%）。现改为**首次 429 原地等 2s 重试、不罚号不换号**，第 2 次才短冷却；基数 15s、封顶 5min | `server/handler.go` 的 `chatRateRetryDelay`、`pool.normalizeConfig`、`TestRotateOn429` / `TestRepeated429CoolsDown` / `TestSoftRateDefaultsAreMinutes` |
 
 回归测试：`internal/upstream/upstream_test.go` 的 `TestClassify`（含 500+参数错误用例）、
 `internal/server/bodyfix_test.go`（含 512/768 边界）。

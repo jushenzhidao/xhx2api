@@ -171,11 +171,15 @@ func normalizeConfig(cfg Config) Config {
 	if cfg.DegradeCool <= 0 {
 		cfg.DegradeCool = 10 * time.Minute
 	}
+	// 429 的恢复是秒级的（2026-10-30 实测：被判「第 7 级退避、冷却 1.1h」的
+	// 账号直接打上游，两个出口 IP 各 2 个请求全部 200）。基数定 15s 让一次
+	// 瞬时过载只损失一个回合，封顶 5min 兜住「某个号真的被限」的情况——
+	// 原来的 60s 起、2h 封顶会把一次抖动锁成半天的容量黑洞。
 	if cfg.SoftRateBase <= 0 {
-		cfg.SoftRateBase = 60 * time.Second
+		cfg.SoftRateBase = 15 * time.Second
 	}
 	if cfg.SoftRateMax <= 0 {
-		cfg.SoftRateMax = 2 * time.Hour
+		cfg.SoftRateMax = 5 * time.Minute
 	}
 	if cfg.IdleWeightPer <= 0 {
 		cfg.IdleWeightPer = 30 * time.Minute

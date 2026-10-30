@@ -377,3 +377,43 @@ func TestPickWaitContextCanceled(t *testing.T) {
 		t.Fatalf("不该等满 5s（实际 %v）", elapsed)
 	}
 }
+
+// TestSoftRateDefaultsAreMinutes 守「429 冷却默认值必须是分钟级」。
+//
+// 2026-10-30 线上事故：上游 429 是秒级恢复的（被判「第 7 级退避、冷却 1.1h」
+// 的账号直接打上游，两个出口 IP 各 2 个请求全部 200），而网关按 60s 起、
+// 2h 封顶做指数退避。一个客户端连撞几次就把全池锁死，75% 的请求变成
+// 503「没有可用账号」。默认值就是那次事故的修复：一次抖动只该损失一个回合。
+func TestSoftRateDefaultsAreMinutes(t *testing.T) {
+	p := New(Config{StateFile: ""})
+	cfg := p.Config()
+	if cfg.SoftRateBase > 30*time.Second {
+		t.Fatalf("SoftRateBase 应 ≤30s（上游秒级恢复），got %s", cfg.SoftRateBase)
+	}
+	if cfg.SoftRateMax > 10*time.Minute {
+		t.Fatalf("SoftRateMax 应 ≤10min（锁太久等于自己废号），got %s", cfg.SoftRateMax)
+	}
+}
+
+// TestSoftRateCooldownNeverExceedsMax 守「连续 429 也不会把号锁几十分钟」。
+func TestSoftRateCooldownNeverExceedsMax(t *testing.T) {
+	p := newTestPool(t, "a")
+	limit := p.Config().SoftRateMax
+	for i := 0; i < 12; i++ {
+		p.Update("a", func(st *State) { st.CooldownUntil = 0 })
+		lease, err := p.Pick(nil, 0)
+		if err != nil {
+			t.Fatalf("第 %d 次 Pick: %v", i+1, err)
+		}
+		kind := "soft_rate"
+		lease.Release(&kind, "429", 0)
+		st, _ := p.Get("a")
+		if left := time.Until(time.Unix(st.CooldownUntil, 0)); left > limit+2*time.Second {
+			t.Fatalf("第 %d 次 429 冷却 %s 超过封顶 %s", i+1, left, limit)
+		}
+	}
+	st, _ := p.Get("a")
+	if st.SoftRateLevel < 5 {
+		t.Fatalf("连续 429 时退避等级应当累加，got %d", st.SoftRateLevel)
+	}
+}

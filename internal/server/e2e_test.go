@@ -519,15 +519,49 @@ func TestRotateOn429(t *testing.T) {
 	if msg["content"] != "换号成功" {
 		t.Fatalf("content = %v", msg["content"])
 	}
-	// 第一个号应进入软冷却。
+	// 首次 429 不罚号：同一个号原地等 2s 重试就能成功。罚号会把一次瞬时
+	// 过载放大成整池长时间冷却——2026-10-30 线上 8% 的 429 正是这样演变成
+	// 75% 的 503（全池被锁 32 分钟到 1.1 小时）。所以这里应当零冷却。
 	var cooling int
 	for _, e := range env.pool.List() {
 		if e.CooldownKind == "soft_rate" {
 			cooling++
 		}
 	}
-	if cooling != 1 {
-		t.Fatalf("应当有 1 个号进入软冷却，got %d (%+v)", cooling, env.pool.List())
+	if cooling != 0 {
+		t.Fatalf("首次 429 不该罚号，got %d 个冷却 (%+v)", cooling, env.pool.List())
+	}
+}
+
+// TestRepeated429CoolsDown 守「连续 429 才罚号」的另一半。
+//
+// 首次 429 是瞬时速率闸，原地重试即可；连着两次都 429 说明这个号确实被限，
+// 得短冷却回避，否则每次请求都白撞它。封顶必须是分钟级：实测被判
+// 「第 7 级退避、冷却 1.1h」的号直接打上游仍然 200，锁太久等于自己废号。
+func TestRepeated429CoolsDown(t *testing.T) {
+	env := setupEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limit exceeded","status":429}}`))
+	}, "1001", "1002")
+
+	resp := env.post(t, "/v1/chat/completions", map[string]any{
+		"model": "raccoon-8c4485", "messages": []any{map[string]any{"role": "user", "content": "hi"}},
+	})
+	if resp.StatusCode != 429 {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("持续 429 应当把 429 透给客户端，HTTP %d: %s", resp.StatusCode, raw)
+	}
+	var cooling int
+	for _, e := range env.pool.List() {
+		if e.CooldownKind == "soft_rate" {
+			cooling++
+			if left := time.Until(time.Unix(e.CooldownUntil, 0)); left > 6*time.Minute {
+				t.Fatalf("429 冷却封顶 5 分钟，got %s", left)
+			}
+		}
+	}
+	if cooling == 0 {
+		t.Fatalf("连续 429 应当罚号，got 0 (%+v)", env.pool.List())
 	}
 }
 

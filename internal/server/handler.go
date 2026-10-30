@@ -762,6 +762,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 			}
+			// 首次 429 不罚号：上游的速率闸是秒级恢复的，罚号会把一次瞬时
+			// 过载放大成整池长时间冷却（见 chatRateRetryDelay 注释）。
+			// 连续第二次才按普通错误处理——那时换号 + 短冷却才是对的。
+			if kind == "soft_rate" && attempt == 0 {
+				lease.ReleaseSuccess(latency)
+				lastErr = cerr
+				if tr != nil {
+					tr.rotations++
+				}
+				log.Printf("INFO: [chat] uid=%s model=%s 429 瞬时过载，%s 后原地重试", a.UID, model, chatRateRetryDelay)
+				select {
+				case <-time.After(chatRateRetryDelay):
+				case <-r.Context().Done():
+					writeOpenAIError(w, http.StatusRequestTimeout, "client_closed", "客户端已断开")
+					return
+				}
+				continue
+			}
 			lease.Release(&kind, msg, latency)
 			lastErr = cerr
 			log.Printf("WARN: [chat] uid=%s model=%s attempt=%d kind=%s: %v", a.UID, model, attempt+1, kind, cerr)
@@ -1004,6 +1022,16 @@ func classifyErr(err error, status int, body string) pool.ErrKind {
 //
 // 不换：请求本身被拒（模型名/参数/内容审核）、网关超时（换号也一样超时）、
 // 客户端断开。换：额度/限流/登录态/5xx/排队/空流。
+// chatRateRetryDelay 是对话遇到 429 后原地重试前的等待。
+//
+// 429 是上游的瞬时速率闸，不是账号故障：2026-10-30 双出口实测（同一账号
+// 从 210.121.44.245 与 117.88.13.53 各发 6 个请求）全部 200，说明
+// 「429 之后要等几十分钟」其实是网关自己的指数退避造成的幻觉。
+// 罚号的代价远大于等待：一个客户端几秒内连撞几次，就能把全池按级别锁到
+// 32 分钟~1.1 小时，此后 75% 的请求变成 503「没有可用账号」。
+// 与生图（imageRateRetryDelay）同策：先原地等，别换号别罚号。
+const chatRateRetryDelay = 2 * time.Second
+
 func shouldRotate(kind pool.ErrKind) bool {
 	switch kind {
 	case "plan_limit", "soft_rate", "session_dead", "server", "busy", "not_found":
