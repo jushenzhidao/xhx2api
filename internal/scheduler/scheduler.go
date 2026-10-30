@@ -238,24 +238,42 @@ func (s *Scheduler) CheckinAccount(ctx context.Context, a *auth.Auth) CheckinOut
 		out.Message = fmt.Sprintf("领取失败：%v；流水查询也失败：%v", claimErr, billErr)
 		return out
 	}
+	// 今天注册的号：发放是次日 00:00 的首批，此刻 bills 里必然一条 daily_grant 都没有。
+	// 这条必须排在「从来没有」前面——否则刚注册几小时的号会被报成 ineligible，
+	// 那句「历史上从未获得每日积分」对它就是谎报（实测踩过：手机号新号报 ineligible）。
+	if reg := s.registerTime(ctx, a); !reg.IsZero() &&
+		reg.In(shanghai()).Format("2006-01-02") == time.Now().In(shanghai()).Format("2006-01-02") {
+		out.Status = "pending"
+		out.Message = "账号今天注册，每日积分次日 00:00 首批发放"
+		return out
+	}
 	if billErr == nil && !ever {
-		// 从未有过 daily_grant：这个号没有每日积分资格（不是失败）。
+		// 注册已过一天仍从未有过 daily_grant：这个号确实没有每日积分资格（不是失败）。
 		out.Status = "ineligible"
 		out.Message = "该账号历史上从未获得每日积分（上游未开通），无需签到"
 		return out
 	}
-	// 今天注册的号：发放要等次日。
-	if reg := a.RegisterTime(); !reg.IsZero() {
-		regDay := reg.In(shanghai()).Format("2006-01-02")
-		if regDay == time.Now().In(shanghai()).Format("2006-01-02") {
-			out.Status = "pending"
-			out.Message = "账号今天注册，每日积分次日 00:00 首批发放"
-			return out
-		}
-	}
 	out.Status = "pending"
 	out.Message = "上游今日尚未发放（服务端 00:00 定时任务），稍后再试"
 	return out
+}
+
+// registerTime 取账号的上游注册时间。
+//
+// 凭证里通常没有这个字段（裸 token 导入、手机号登录都不带 register_at），
+// 这时向上游 user_info 问一次并落盘——只问一次，之后走本地缓存。
+// 拿不到就返回零值，调用方按「老号」处理（宁可报 ineligible 也不谎报 pending）。
+func (s *Scheduler) registerTime(ctx context.Context, a *auth.Auth) time.Time {
+	if reg := a.RegisterTime(); !reg.IsZero() {
+		return reg
+	}
+	t, ok := s.up.UserCreatedAt(ctx, a)
+	if !ok {
+		return time.Time{}
+	}
+	a.SetRegisterAt(t)
+	_ = a.SaveAtomic()
+	return t
 }
 
 // checkinAll 对全池账号跑一轮签到。

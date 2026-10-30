@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -697,11 +698,26 @@ func randomKey() string {
 	return "sk-xhx-" + hex.EncodeToString(b[:])
 }
 
-// SaveConfig 校验、落盘并热应用面板提交的配置。
+// SaveConfig 校验、落盘并热应用面板提交的配置（合并语义）。
 //
-// 落盘前先与磁盘上的原文件做深合并：面板只提交它管理的键，用户手写的注释性
+// 落盘前先与磁盘上的原文件做深合并：面板表单只提交它管理的键，用户手写的注释性
 // 字段（"_comment" 之类）与未来版本新增的键不该被洗掉。
+//
+// 合并语义的代价是**删不掉键**：提交里没有的键会被磁盘旧值补回来。所以集合型
+// 配置（`aliases`）单独按「提交即全量」处理，JSON 编辑器另走 ReplaceConfig。
 func SaveConfig(path string, raw []byte) (*Config, []string, error) {
+	return saveConfig(path, raw, false)
+}
+
+// ReplaceConfig 以提交内容为准落盘：已知键没提到就是删除。
+//
+// 给面板的 JSON 编辑器用——那里显示的是整份配置，用户删掉一行就该真的消失。
+// 未知键（"_comment"、未来版本字段）照旧保留，免得注释被吃掉。
+func ReplaceConfig(path string, raw []byte) (*Config, []string, error) {
+	return saveConfig(path, raw, true)
+}
+
+func saveConfig(path string, raw []byte, replace bool) (*Config, []string, error) {
 	var incoming map[string]any
 	if err := json.Unmarshal(raw, &incoming); err != nil {
 		return nil, nil, fmt.Errorf("提交内容不是合法 JSON: %w", err)
@@ -717,7 +733,25 @@ func SaveConfig(path string, raw []byte) (*Config, []string, error) {
 	if _, err := ParseConfig(raw); err != nil {
 		return nil, nil, err
 	}
-	merged := mergeMaps(current, incoming)
+	var merged map[string]any
+	if replace {
+		if len(incoming) == 0 {
+			// 空对象在 replace 语义下等于「全删」：照做会把 api_key 重新随机生成，
+			// 所有客户端当场鉴权失败。宁可拒绝。
+			return nil, nil, errors.New("提交内容为空：整份覆盖模式至少要保留 api_key")
+		}
+		merged = replaceMaps(current, incoming)
+	} else {
+		merged = mergeMaps(current, incoming)
+	}
+	// 兜底：提交里丢了 api_key 就沿用磁盘上的旧值。
+	// 删掉 api_key ≠ 关闭鉴权（空 = 不鉴权），它会走 applyDefaults 重新随机生成，
+	// 结果是全客户端 401——这种「静默自锁」不该由一次手滑触发。
+	if _, ok := merged["api_key"]; !ok {
+		if old, ok := current["api_key"]; ok {
+			merged["api_key"] = old
+		}
+	}
 	mergedRaw, err := json.Marshal(merged)
 	if err != nil {
 		return nil, nil, err
@@ -816,9 +850,21 @@ func boolStr(b bool) string {
 	return "0"
 }
 
-// mergeMaps 深合并（嵌套对象逐键覆盖）。
+// setSectionKeys 是「用户可以在面板里自由增删行」的集合型配置段。
+//
+// 这类段提交即全量：深合并会把用户删掉的行用旧值补回来，表现就是
+// 「删了保存又出现」。所以它们整段替换，不做递归合并。
+var setSectionKeys = map[string]bool{
+	"aliases": true,
+}
+
+// mergeMaps 深合并（嵌套对象逐键覆盖），集合型段整段替换。
 func mergeMaps(cur, incoming map[string]any) map[string]any {
 	for k, v := range incoming {
+		if setSectionKeys[k] {
+			cur[k] = v
+			continue
+		}
 		if inMap, ok := v.(map[string]any); ok {
 			if curMap, ok := cur[k].(map[string]any); ok {
 				cur[k] = mergeMaps(curMap, inMap)
@@ -828,6 +874,68 @@ func mergeMaps(cur, incoming map[string]any) map[string]any {
 		cur[k] = v
 	}
 	return cur
+}
+
+// knownTopKeys / knownSubKeys 按结构体 tag 反推「已知键」：用于区分
+// 「用户不想要了」与「面板不管的键」，replaceMaps 只对后者做保留。
+var knownTopKeys, knownSubKeys = configSchemaKeys()
+
+func configSchemaKeys() (top map[string]bool, sub map[string]map[string]bool) {
+	top = map[string]bool{}
+	sub = map[string]map[string]bool{}
+	t := reflect.TypeOf(Config{})
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name == "" || name == "-" {
+			continue
+		}
+		top[name] = true
+		if f.Type.Kind() != reflect.Struct {
+			continue
+		}
+		keys := map[string]bool{}
+		for j := 0; j < f.Type.NumField(); j++ {
+			n, _, _ := strings.Cut(f.Type.Field(j).Tag.Get("json"), ",")
+			if n != "" && n != "-" {
+				keys[n] = true
+			}
+		}
+		sub[name] = keys
+	}
+	return top, sub
+}
+
+// replaceMaps 以提交内容为准：已知键没提到就是删除，未知键（"_comment"、
+// 未来版本字段）连同一层子键原样保留。
+func replaceMaps(cur, incoming map[string]any) map[string]any {
+	out := make(map[string]any, len(incoming)+len(cur))
+	for k, v := range cur {
+		if knownTopKeys[k] {
+			continue // 已知段交给提交内容决定去留
+		}
+		out[k] = v
+	}
+	for k, v := range incoming {
+		inMap, isMap := v.(map[string]any)
+		curMap, curIsMap := cur[k].(map[string]any)
+		if sub, ok := knownSubKeys[k]; ok && isMap && curIsMap {
+			// 保留段内未知子键（如 upstream 下的 "_comment"），已知子键以提交为准。
+			section := make(map[string]any, len(inMap))
+			for ck, cv := range curMap {
+				if !sub[ck] {
+					section[ck] = cv
+				}
+			}
+			for ik, iv := range inMap {
+				section[ik] = iv
+			}
+			out[k] = section
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // restartRequiredFields 返回需要重启才能生效的字段清单。

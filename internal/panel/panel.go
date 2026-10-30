@@ -51,7 +51,9 @@ type Config struct {
 	// ConfigPath / LoadConfig / SaveConfig 用于配置页（nil 时返回 501）。
 	ConfigPath string
 	LoadConfig func() (any, error)
-	SaveConfig func(raw []byte) ([]string, error)
+	// SaveConfig 落盘配置。replace=false 走合并（表单只提交它管的键），
+	// replace=true 以提交内容为准（JSON 编辑器整份提交，删掉的键要真删）。
+	SaveConfig func(raw []byte, replace bool) ([]string, error)
 	// Usage / RequestLog 可观测数据（nil 时对应接口返回空）。
 	Usage      *usage.Recorder
 	RequestLog *reqlog.Recorder
@@ -526,7 +528,7 @@ func (p *Panel) saveConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	restart, err := p.cfg.SaveConfig(body)
+	restart, err := p.cfg.SaveConfig(body, r.URL.Query().Get("mode") == "replace")
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return

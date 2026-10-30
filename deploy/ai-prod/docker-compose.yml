@@ -1,6 +1,6 @@
 # xhx2api · ai-prod 部署声明（2026-10-26）
 #
-# 源（第一真源）：github.com/rsfree/xhx2api —— Go 单二进制 + 内嵌面板。
+# 源（第一真源）：github.com/jushenzhidao/xhx2api —— Go 单二进制 + 内嵌面板。
 # 作用：把小浣熊（office-raccoon）网页端/桌面端登录态包成协议兼容网关
 #   （/v1/chat/completions、/v1/messages、/v1/responses、/v1/images/generations）
 #   + 运维面板 /panel/ + 定时任务（签到 9 点 / 保活 3 点）。
@@ -8,20 +8,29 @@
 # 与 workbuddy2api / textin / jimeng 同规：
 #   - **端口只绑回环** 127.0.0.1（ai-prod 的公网入口一律 nginx + *.1task.cn）。
 #     上游 README 里的 compose 写 "7867:7867"，照抄等于把网关裸到公网，此处已改。
-#   - 容器以镜像内 uid 10001(app) 运行 ⇒ 宿主 ./auths ./data 必须 chown 10001:10001。
+#   - 容器以镜像内 uid 10001(app) 运行 ⇒ 宿主 ./auths ./data ./conf 必须 chown 10001:10001。
 #   - 定时任务按本地时区排程 ⇒ 必须 TZ=Asia/Shanghai，否则签到/保活全错 8 小时。
 #
-# 镜像：ghcr.io/rsfree/xhx2api（CI 的 docker workflow 在 push main 时构建多架构镜像，
+# ⚠ 配置必须**目录挂载**（./conf:/app/conf），不能单文件挂载（./config.json:/app/config.json）：
+#   面板保存走「写 config.json.tmp → rename 覆盖」，而 rename 的目标是 bind mount 的
+#   mountpoint 时内核直接返回 EBUSY（device or resource busy），保存必然失败且配置不变。
+#   2026-10-29 在 ai-prod 实测：/proc/mounts 里 /app/config.json 是独立挂载点，
+#   mv 探测 → Resource busy。改成目录挂载后 config.json 是挂载点里的普通文件，rename 合法。
+#   （./auths 与 ./data 一直是目录挂载，所以账号/池状态写回从来没出过这个问题。）
+#
+# 镜像：ghcr.io/jushenzhidao/xhx2api（CI 的 docker workflow 在 push main 时构建多架构镜像，
 #   tag 为 main / latest / sha-<7位>）。默认钉 latest；回滚时改 XHX2API_IMAGE_TAG
 #   指向具体的 sha-<7位>，比 latest 可审计。
 name: xhx2api
 
 services:
   xhx2api:
-    image: ghcr.io/rsfree/xhx2api:${XHX2API_IMAGE_TAG:-latest}
+    image: ghcr.io/jushenzhidao/xhx2api:${XHX2API_IMAGE_TAG:-latest}
     container_name: xhx2api
     restart: unless-stopped
     user: "${PUID:-10001}:${PGID:-10001}"
+    # 覆盖镜像默认的 `-config /app/config.json`，指到目录挂载里（迁移步骤见 README）。
+    entrypoint: ["/app/xhx2api", "-config", "/app/conf/config.json"]
     environment:
       TZ: Asia/Shanghai
     ports:
@@ -30,7 +39,7 @@ services:
     volumes:
       - ./auths:/app/auths           # 账号凭证（JWT/refresh）—— 等同明文密码，权限 700
       - ./data:/app/data             # 池状态 state.json + 用量 + 请求日志 + 目录缓存
-      - ./config.json:/app/config.json   # 单文件挂载：宿主机必须先有它，否则会被建成目录
+      - ./conf:/app/conf             # 配置目录（内含 config.json）；必须目录挂载，理由见文件头
     healthcheck:
       # /healthz 恒 200（不依赖账号健康度），可作存活断言。
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7867/healthz >/dev/null || exit 1"]

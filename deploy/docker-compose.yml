@@ -2,11 +2,16 @@
 #
 # 与仓库根的 docker-compose.yml 的区别：
 #   - 监听 127.0.0.1:7867（只让本机 nginx 访问，不直接暴露公网）
-#   - 挂载 ./deploy/config.json（生产配置，含 login.callback_base）
+#   - 挂载 ./deploy/conf/（生产配置目录，含 login.callback_base）
+#
+# ⚠ 配置文件必须**目录挂载**：面板保存是「写 config.json.tmp → rename 覆盖」，
+#   rename 的目标若是单文件 bind mount 的 mountpoint，内核返回 EBUSY
+#   （device or resource busy），保存永远失败。详见 deploy/ai-prod/docker-compose.yml 文件头。
 #
 # 用法：
-#   cp config.example.json deploy/config.json
-#   # 编辑 deploy/config.json：
+#   mkdir -p deploy/conf
+#   cp config.example.json deploy/conf/config.json
+#   # 编辑 deploy/conf/config.json：
 #   #   "listen": "127.0.0.1:7867"
 #   #   "api_key": "<随机生成>"
 #   #   "login": { "callback_base": "https://xhx2api.1task.cn" }
@@ -23,6 +28,7 @@ services:
     restart: unless-stopped
     # 容器以 uid 10001 运行；宿主机目录属主不同时用 PUID/PGID 覆盖。
     user: "${PUID:-10001}:${PGID:-10001}"
+    entrypoint: ["/app/xhx2api", "-config", "/app/conf/config.json"]
     environment:
       - TZ=Asia/Shanghai
     ports:
@@ -31,7 +37,7 @@ services:
     volumes:
       - ../auths:/app/auths
       - ../data:/app/data
-      - ./config.json:/app/config.json
+      - ./conf:/app/conf
     healthcheck:
       # 镜像自带的 HEALTHCHECK 打 /healthz（恒 200）；这里再声明一次便于 compose 观测。
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:7867/healthz >/dev/null || exit 1"]

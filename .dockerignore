@@ -3,6 +3,7 @@
 .github
 auths
 data
+conf
 config.json
 *.log
 xhx2api

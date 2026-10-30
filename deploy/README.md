@@ -1,7 +1,7 @@
 # 线上部署（1task.cn）
 
 **已上线**：https://xhx2api.1task.cn（ai-prod = 210.121.44.245，`/opt/xhx2api`，
-容器 `ghcr.io/rsfree/xhx2api:sha-<提交>`，端口 `127.0.0.1:39026`）。
+容器 `ghcr.io/jushenzhidao/xhx2api:sha-<提交>`，端口 `127.0.0.1:39026`）。
 运维手册见 `deploy/ai-prod/README.md`。
 
 目标形态：`https://xhx2api.1task.cn` → nginx（TLS）→ `127.0.0.1:39026` 容器。
@@ -9,7 +9,8 @@
 ## 1. 配置
 
 ```bash
-cp config.example.json deploy/config.json
+mkdir -p deploy/conf
+cp config.example.json deploy/conf/config.json
 ```
 
 改三处：
@@ -47,7 +48,13 @@ docker compose -f deploy/docker-compose.yml logs -f
 
 > 挂载目录属主不对会报 `permission denied`（写 `auths/*.json.tmp` 失败）：
 > `PUID=$(id -u) PGID=$(id -g) docker compose -f deploy/docker-compose.yml up -d`
-> 或 `sudo chown -R 10001:10001 auths data deploy/config.json`。
+> 或 `sudo chown -R 10001:10001 auths data deploy/conf`。
+
+> 🔴 **配置必须目录挂载**（`./conf:/app/conf` + `-config /app/conf/config.json`）。
+> 面板保存走「写 `config.json.tmp` → `rename` 覆盖」，而 `rename` 如果目标是
+> 单文件 bind mount 的 mountpoint，内核直接返回 `EBUSY`，面板报
+> `rename /app/config.json.tmp /app/config.json: device or resource busy` 且配置不变。
+> 老部署（单文件挂载）升级时按 `deploy/ai-prod/README.md` 的「配置挂载迁移」操作。
 
 ## 3. nginx + 证书
 

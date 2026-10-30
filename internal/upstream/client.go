@@ -802,17 +802,30 @@ func (c *Client) refreshOnce(ctx context.Context, a *auth.Auth) (token, refresh 
 func (c *Client) GetUserInfo(ctx context.Context, a *auth.Auth) (uid, nickname, org string, err error) {
 	token := a.JWT()
 	if token != "" {
-		resp, uerr := c.doJSON(ctx, http.MethodGet, c.authBase()+UserInfoPath, nil,
-			map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token})
-		if uerr == nil {
-			if data, perr := payloadOf(resp, "用户资料"); perr == nil {
-				uid = text(data, "id", "user_id", "uid")
-				nickname = text(data, "name", "nickname")
-				org = text(data, "office_org_name", "org_code")
-				if uid != "" {
-					return uid, nickname, org, nil
-				}
+		// 取一次资料；拿不到时若报的是「IAM 票未确认」，补一次确认再取。
+		// 少了这一步，未确认的票会静默回落到 JWT 里的 pu-… 主体（uid 看着有值、
+		// 实际是 IAM 主体），账号入池后每个请求都是 400 iam_confirm_required。
+		fetch := func() (bool, error) {
+			resp, uerr := c.doJSON(ctx, http.MethodGet, c.authBase()+UserInfoPath, nil,
+				map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token})
+			if uerr != nil {
+				return false, uerr
 			}
+			data, perr := payloadOf(resp, "用户资料")
+			if perr != nil {
+				return false, perr
+			}
+			uid = text(data, "id", "user_id", "uid")
+			nickname = text(data, "name", "nickname")
+			org = text(data, "office_org_name", "org_code")
+			return uid != "", nil
+		}
+		ok, ferr := fetch()
+		if !ok && isIAMConfirmRequired(ferr) && c.ConfirmIAM(ctx, token) == nil {
+			ok, _ = fetch()
+		}
+		if ok {
+			return uid, nickname, org, nil
 		}
 	}
 	uid = auth.JWTUserID(token)
