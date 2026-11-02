@@ -819,8 +819,12 @@ func (p *Panel) accountBindDevice(w http.ResponseWriter, r *http.Request) {
 	if serr := a.SaveAtomic(); serr != nil {
 		log.Printf("WARN: 账号 %s 绑定设备后落盘失败（重启后需重新绑定）: %v", uid, serr)
 	}
+	note := "已绑定"
+	if deviceID == "" {
+		note = "此前已绑定，此次无需重复"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"uid": uid, "device_id": deviceID, "device_bound": a.DeviceBound,
+		"uid": uid, "device_id": deviceID, "device_bound": a.DeviceBound, "note": note,
 	})
 }
 
@@ -836,6 +840,7 @@ func (p *Panel) accountsBindDeviceAll(w http.ResponseWriter, r *http.Request) {
 		UID      string `json:"uid"`
 		OK       bool   `json:"ok"`
 		DeviceID string `json:"device_id,omitempty"`
+		Note     string `json:"note,omitempty"`
 		Error    string `json:"error,omitempty"`
 		Skipped  bool   `json:"skipped,omitempty"`
 	}
@@ -862,10 +867,21 @@ func (p *Panel) accountsBindDeviceAll(w http.ResponseWriter, r *http.Request) {
 		if serr := a.SaveAtomic(); serr != nil {
 			log.Printf("WARN: 账号 %s 绑定设备后落盘失败: %v", uid, serr)
 		}
-		results = append(results, result{UID: uid, OK: true, DeviceID: deviceID})
+		results = append(results, result{UID: uid, OK: true, DeviceID: deviceID, Note: deviceBindNote(deviceID)})
 		okCount++
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": okCount, "results": results})
+}
+
+// deviceBindNote 给「上游说已经绑过」一个能看懂的说明。
+//
+// 上游对已绑过的会话回 HTTP 400 + code 100002。我们把它当成功（本地状态
+// 确实要补成 bound），但要让人看得出「这次没有真的新建设备」。
+func deviceBindNote(deviceID string) string {
+	if deviceID == "" {
+		return "此前已绑定"
+	}
+	return ""
 }
 
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {

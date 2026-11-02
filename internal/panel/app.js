@@ -1494,7 +1494,11 @@
           const list = r.results || [];
           const skipped = list.filter((x) => x.skipped).length;
           const failed = list.filter((x) => x.error).length;
-          toast(`补绑完成：成功 ${r.ok || 0} / 已绑跳过 ${skipped} / 失败 ${failed}`, failed ? "warn" : "ok");
+          // 「此前已绑定」也计入成功：上游侧本来就是 bound，
+          // 这次只是把本地状态补上，不该让用户以为失败了。
+          const already = list.filter((x) => x.note).length;
+          const extra = already ? `（${already} 个此前已绑定，已同步本地状态）` : "";
+          toast(`补绑完成：成功 ${r.ok || 0} / 已绑跳过 ${skipped} / 失败 ${failed}${extra}`, failed ? "warn" : "ok");
           if (failed) console.warn("补绑失败详情:", list.filter((x) => x.error));
           await loadOverview();
           return;

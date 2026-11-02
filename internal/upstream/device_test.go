@@ -166,3 +166,56 @@ func TestBindDeviceRequiresDeviceID(t *testing.T) {
 		t.Fatal("失败时不能把账号标成 bound")
 	}
 }
+
+// 「已经绑过」不能当失败。
+//
+// 上游回 HTTP 400 + code 100002，而不是 200 也不是 409 —— 只看状态码必然误判。
+// 2026-11-03 线上实测：11 个号上游全部 bound=true，但批量补绑把其中 2 个
+// 报成「失败」，本地 → 状态也没补上，面板就一直显示「未绑设备」。
+// 危害不只是难看：这 2 个号明明是好的，却会被当成需要重新登录。
+func TestBindDeviceAlreadyBoundIsNotFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"code":100002,"message":"device already bound to current session"}`))
+	}))
+	defer srv.Close()
+
+	c := New()
+	c.SetAgentHosts("", srv.URL)
+	a := &auth.Auth{Data: auth.Data{UID: "7000004", AccessToken: "tok", DeviceBound: "unbound"}}
+
+	// 不应返回错误
+	if _, err := c.BindDevice(context.Background(), a); err != nil {
+		t.Fatalf("已绑不该报错: %v", err)
+	}
+	if a.DeviceBound != "bound" {
+		t.Fatalf("已绑时也要把本地状态改成 bound，实得 %q", a.DeviceBound)
+	}
+}
+
+// 别的 400 不能被误认成「已绑」。
+//
+// 400 里带 100002 只是必要条件，还要有 already/exist/bound 之类语义。
+// 这条防的是「把真错误吞掉」——那比误报更危险，因为面板会显示成功而号其实是坏的。
+func TestBindDeviceOtherBadRequestStillFails(t *testing.T) {
+	for _, body := range []string{
+		`{"code":100002,"message":"invalid parameter"}`,
+		`{"code":100003,"message":"device already bound"}`,
+		`{"code":200001,"message":"authorization_empty_error"}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(body))
+		}))
+		c := New()
+		c.SetAgentHosts("", srv.URL)
+		a := &auth.Auth{Data: auth.Data{UID: "7000005", AccessToken: "tok"}}
+		if _, err := c.BindDevice(context.Background(), a); err == nil {
+			t.Errorf("正文 %s 不该被当成已绑定而吞掉", body)
+		}
+		if a.DeviceBound == "bound" {
+			t.Errorf("正文 %s 失败时不能标 bound", body)
+		}
+		srv.Close()
+	}
+}

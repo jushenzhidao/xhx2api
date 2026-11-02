@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/rsfree/xhx2api/internal/auth"
 )
@@ -111,6 +112,15 @@ func (c *Client) BindDevice(ctx context.Context, a *auth.Auth) (string, error) {
 		return "", err
 	}
 	if resp.Status < 200 || resp.Status >= 300 {
+		// 100002 = 已经绑过。这不是失败：上游的语义是「这个会话已有设备」，
+		// 而我们要的就是「有设备」。当成错误会让批量补绑把已 bound 的号
+		// 报成失败，本地状态也补不上，面板就永远显示「未绑设备」——
+		// 2026-11-03 线上实测：11 个号上游全 bound，本地只记了 9 个。
+		if alreadyBound(string(resp.Body)) {
+			a.DeviceBound = "bound"
+			a.DeviceCheckedAt = time.Now().Format(time.RFC3339)
+			return "", nil
+		}
 		return "", &Error{Kind: Classify(resp.Status, string(resp.Body)), Status: resp.Status,
 			Msg: fmt.Sprintf("绑定可信设备失败（HTTP %d）：%s", resp.Status, truncate(string(resp.Body), 200))}
 	}
@@ -137,6 +147,20 @@ func (c *Client) BindDevice(ctx context.Context, a *auth.Auth) (string, error) {
 	a.ClientDeviceID = deviceID
 	a.DeviceBound = "bound"
 	return bound, nil
+}
+
+// alreadyBound 判断上游的「已经绑过了」。
+//
+// 上游把它放在 HTTP 400 + code 100002 里（不是 200，也不是 409），
+// 所以只能看正文。code 既有数字也有字符串形态，两种都认。
+func alreadyBound(body string) bool {
+	if !strings.Contains(body, "100002") {
+		return false
+	}
+	lower := strings.ToLower(body)
+	// 双重确认：避免别的 400 恰好也带了 100002 这个子串。
+	return strings.Contains(lower, "already") || strings.Contains(body, "已绑定") ||
+		strings.Contains(lower, "exist") || strings.Contains(lower, "bound")
 }
 
 // effectiveVersion 当前出站客户端版本。
