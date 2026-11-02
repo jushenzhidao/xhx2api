@@ -66,6 +66,13 @@ func TestBindDeviceSendsOfficialShape(t *testing.T) {
 	if gotHeader.Get("X-Client-Device-ID") == "" {
 		t.Error("X-Client-Device-ID 为空：上游靠它认设备，缺了等于每次都是新机器")
 	}
+	// Authorization 必须带：第一版就是漏了它，线上回 401
+	// `authorization_empty_error`，而同样的 token 人肉 curl 是 200，
+	// 表现极像「token 失效」，排查方向直接被带偏。
+	// 根因是用了 clientIDHeaders()（不含鉴权）而不是 authHeader(a)。
+	if got := gotHeader.Get("Authorization"); got != "Bearer tok" {
+		t.Errorf("Authorization = %q，应为 Bearer tok（缺了它上游回 401 authorization_empty_error）", got)
+	}
 	if gotBody["client_platform"] != "desktop-windows" || gotBody["os"] != "windows" {
 		t.Errorf("平台字段不对: %v", gotBody)
 	}

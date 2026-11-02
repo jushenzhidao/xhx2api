@@ -86,7 +86,11 @@ func (c *Client) BindDevice(ctx context.Context, a *auth.Auth) (string, error) {
 		return "", err
 	}
 
-	headers := c.clientIDHeaders()
+	// 用 authHeader 而不是 clientIDHeaders：后者**不带 Authorization**。
+	// 线上实测过一次 —— 少了这个头，上游回 HTTP 401
+	// `{"code":200001,"message":"authorization_empty_error"}`，
+	// 而人肉 curl 同样的 token 却是 200，看起来像「token 失效」，极难判断。
+	headers := c.authHeader(a)
 	// 官方客户端在这四个头上带的是绑定专用的写法：X-Client-Device-ID 必带，
 	// 平台不带 -x64 后缀。服务端显然用它们做一致性校验，所以照抄。
 	//
