@@ -40,6 +40,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -339,19 +340,38 @@ func (c *Client) finishLogin(ctx context.Context, account *auth.Auth) (*auth.Aut
 			account.Nickname = nick
 		}
 	}
-	// 顺手把「可信设备绑定」状态取回来。
+	// 顺手把「可信设备绑定」状态取回来，没绑的当场绑上。
 	//
-	// 不取的话，导入界面只会说「成功」，而 bound=false 的号**永远没有每日
-	// 积分**（实测 11 个号里 9 个如此）。用户要等到第二天签到才发现，那时
-	// 已经白等一轮。这里多花一次 user_info，换导入当场就把话说清楚。
-	// 取不到不影响登录本身：只是不知道，按「未知」处理，不编结论。
-	if prof, perr := c.UserProfile(ctx, account); perr == nil && prof.DeviceState != "" {
-		account.DeviceBound = prof.DeviceState
-		account.DeviceCheckedAt = time.Now().Format(time.RFC3339)
+	// 不查的话，导入界面只会说「成功」，而 bound=false 的号**永远没有每日
+	// 积分**（2026-11-02 实测 11 个号里 9 个如此）。用户要等到第二天签到
+	// 才发现，那时已经白等一轮。
+	//
+	// 会自动绑：登录流程本身不建可信设备（IAM 通道尤其不建），要靠
+	// /devices_current_bind 单独调一次。补绑失败不影响登录本身——账号能正常
+	// 用（能聊天、能查余额），只是没有每日积分，界面上会标出来。
+	needBind := true
+	if prof, perr := c.UserProfile(ctx, account); perr == nil {
+		if prof.DeviceState != "" {
+			account.DeviceBound = prof.DeviceState
+		}
 		if !prof.CreatedAt.IsZero() {
 			account.RegisterAt = prof.CreatedAt.Format(time.RFC3339)
 		}
+		needBind = !prof.DeviceBound
 	}
+	// 没绑就当场绑上。
+	//
+	// 注意这里是「查不到状态也照样绑」：UserProfile 失败只说明我们不知道现状，
+	// 不代表号已经绑好了；而 BindDevice 本身幂等（已绑的号上游回
+	// device_session_mismatch，代码按成功处理），所以多试一次没有副作用。
+	// 反过来，漏绑的代价是这个号永远没有每日积分。
+	if needBind {
+		if _, berr := c.BindDevice(ctx, account); berr != nil {
+			log.Printf("[login] 账号 %s 自动绑可信设备失败（可用面板「补绑设备」重试）: %v",
+				account.UID, berr)
+		}
+	}
+	account.DeviceCheckedAt = time.Now().Format(time.RFC3339)
 	if account.UID == "" {
 		return nil, &Error{Kind: ErrClient, Status: 400, Msg: auth.ErrNoIdentity.Error()}
 	}

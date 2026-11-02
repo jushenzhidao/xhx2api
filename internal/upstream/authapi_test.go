@@ -269,7 +269,11 @@ func TestLoginWithSmsConfirmsIAMBeforeProfile(t *testing.T) {
 		case "/api/web/auth/v1/iam/confirm":
 			fmt.Fprint(w, `{"code":0,"message":"success"}`)
 		case "/api/web/auth/v1/user_info":
+			// 故意不返回 trusted_device：模拟「查不到设备态」，
+			// 断言此时登录流程仍然会去尝试绑设备（漏绑的代价是永久没有每日积分）。
 			fmt.Fprint(w, `{"code":0,"message":"success","data":{"id":"7815106","name":"RaccoonEmily"}}`)
+		case "/api/web/auth/v1/devices_current_bind":
+			fmt.Fprint(w, `{"code":0,"message":"success","data":{"device_id":"dev-x","trusted_device":true}}`)
 		default:
 			t.Errorf("意外端点: %s", r.URL.Path)
 		}
@@ -301,6 +305,11 @@ func TestLoginWithSmsConfirmsIAMBeforeProfile(t *testing.T) {
 	}
 	if profile < 0 || confirm > profile {
 		t.Fatalf("必须先 confirm 再 user_info，实际 %v", paths)
+	}
+	// 设备态查不到也要去绑：IAM 通道本身不建可信设备，
+	// 不补这一步的号会永远拿不到每日积分（2026-11-03 实测 9/11 如此）。
+	if idx("/api/web/auth/v1/devices_current_bind") < 0 {
+		t.Fatalf("登录后应自动补绑可信设备，实际请求序列 %v", paths)
 	}
 }
 
