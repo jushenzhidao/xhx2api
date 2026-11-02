@@ -148,8 +148,11 @@ func (c *Client) BalancePackages(ctx context.Context, a *auth.Auth) ([]CreditPac
 
 // dailyBatchExpiry 查 bills，取每日发放批次里最早的**未过期**到期时刻（unix 秒）。
 // 失败静默返回 0（构成页照常显示余额，只是到期分布缺这一列）。
+//
+// 用 income 口径：每日积分有效期 7 天，而 type=all 的窗口对重度账号只有 1~2 天，
+// 会把 5 天后才到期的那批整个漏掉，报出比实际更晚的到期时间。
 func (c *Client) dailyBatchExpiry(ctx context.Context, a *auth.Auth) int64 {
-	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsQuery, nil, c.authHeader(a))
+	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
 	if err != nil {
 		return 0
 	}
@@ -197,7 +200,7 @@ func (c *Client) UserEntUsageDetailWithExpiry(ctx context.Context, a *auth.Auth)
 // 只报时刻不够：账号余额里往往混着不会过期的奖励/充值积分，面板若拿可用总额
 // 去算「哪天会作废多少」，会得出「6490 分 5 天后全没」这种吓人的假数。
 func (c *Client) earliestBatchExpiry(ctx context.Context, a *auth.Auth) (expire, points int64) {
-	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsQuery, nil, c.authHeader(a))
+	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
 	if err != nil {
 		return 0, 0
 	}
@@ -277,11 +280,15 @@ func (c *Client) CheckinStatus(ctx context.Context, a *auth.Auth) (checkedIn boo
 // DailyGrant 读 bills 流水：今天（东八区）是否已有 daily_grant 入账，以及这个号
 // **历史上有没有过** daily_grant。
 //
+// 用 type=income 而不是 type=all：上游 paging.offset 是死参数（>0 恒空），
+// type=all 只会给最近 100 条，重度账号一天就能把它填满 1.5 天窗口，导致
+// 「今天发过」和「历史发过」同时失真（见 BillsIncomeQuery 注释）。
+//
 // 后一半是给「上游压根没给这个号开每日积分」用的：实测有的号注册多日、bills 里
 // 只有 reward_grant（注册礼包/桌面端登录奖励），daily_points 恒为 0。这种号
 // claim 再多轮也不会有 daily_grant，报「签到失败」是谎报。
 func (c *Client) DailyGrant(ctx context.Context, a *auth.Auth) (today, ever bool, err error) {
-	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsQuery, nil, c.authHeader(a))
+	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
 	if err != nil {
 		return false, false, err
 	}
@@ -392,34 +399,71 @@ func (c *Client) RecentBills(ctx context.Context, a *auth.Auth, limit int) ([]Bi
 	return out, nil
 }
 
-// UserCreatedAt 取账号注册时间。
+// UserProfile 是 user_info 里调度用得上的那部分。
+type UserProfile struct {
+	// CreatedAt 是上游注册时间（拿不到为零值）。
+	CreatedAt time.Time
+	// DeviceBound 报告当前会话是否已绑定可信设备。
+	//
+	// 这是「有没有每日积分资格」的真正判据：2026-11-02 实测 11 个号，
+	// 9 个 bound=false（reason=session_without_bound_device）的全都没拿到过
+	// 任何 daily_grant，2 个 bound=true 的天天有 300 分。裸 token 与手机号
+	// 导入的号都落在 unbound，所以它们永远不会有每日积分。
+	DeviceBound bool
+	// DeviceState 是上游给的原始状态（bound / unbound），"" 表示上游没这个字段。
+	DeviceState string
+	// DeviceReason 是上游解释为什么没绑（如 session_without_bound_device），便于排障。
+	DeviceReason string
+}
+
+// UserProfile 取账号的上游资料：注册时间 + 可信设备绑定状态。
 //
-// 只用来区分「上游今天还没发每日积分」和「签到了但没落账」：每日积分发放是
-// 服务端 00:00 的定时任务，当天新注册的号要等次日首批，此前 bills 里根本没有
-// daily_grant——那不是签到失败，是还没到发放时点。
-func (c *Client) UserCreatedAt(ctx context.Context, a *auth.Auth) (time.Time, bool) {
+// 合并成一次请求：签到判「今天注册」和判「有没有每日积分资格」都要 user_info，
+// 分两次查等于把上游请求量翻倍，而且两边可能看到不同快照。
+func (c *Client) UserProfile(ctx context.Context, a *auth.Auth) (UserProfile, error) {
+	var prof UserProfile
 	if a == nil || a.JWT() == "" {
-		return time.Time{}, false
+		return prof, errors.New("账号缺少 access_token")
 	}
 	resp, err := c.doJSON(ctx, http.MethodGet, c.authBase()+UserInfoPath, nil,
 		map[string]string{"Accept": "application/json", "Authorization": "Bearer " + a.JWT()})
 	if err != nil {
-		return time.Time{}, false
+		return prof, err
 	}
 	data, err := payloadOf(resp, "用户资料")
 	if err != nil {
-		return time.Time{}, false
+		return prof, err
 	}
-	raw := text(data, "created_at", "register_time", "createdAt")
-	if raw == "" {
-		return time.Time{}, false
-	}
-	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05"} {
-		if t, perr := time.Parse(layout, raw); perr == nil {
-			return t, true
+	if raw := text(data, "created_at", "register_time", "createdAt"); raw != "" {
+		for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05"} {
+			if t, perr := time.Parse(layout, raw); perr == nil {
+				prof.CreatedAt = t
+				break
+			}
 		}
 	}
-	return time.Time{}, false
+	// trusted_device 是嵌套对象；老账号 / 未绑定的号也可能整个缺字段，
+	// 这时保持零值（= 未知），别把「没这个字段」当成「确认未绑定」。
+	if device, ok := data["trusted_device"].(map[string]any); ok {
+		prof.DeviceState = text(device, "device_bind_state")
+		prof.DeviceReason = text(device, "reason")
+		if bound, ok := device["bound"].(bool); ok {
+			prof.DeviceBound = bound
+			if prof.DeviceState == "" {
+				prof.DeviceState = map[bool]string{true: "bound", false: "unbound"}[bound]
+			}
+		}
+	}
+	return prof, nil
+}
+
+// UserCreatedAt 取账号注册时间（UserProfile 的窄接口，保留给老调用方）。
+func (c *Client) UserCreatedAt(ctx context.Context, a *auth.Auth) (time.Time, bool) {
+	prof, err := c.UserProfile(ctx, a)
+	if err != nil || prof.CreatedAt.IsZero() {
+		return time.Time{}, false
+	}
+	return prof.CreatedAt, true
 }
 
 // ---------------------------------------------------------------------------

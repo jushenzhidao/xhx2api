@@ -75,6 +75,17 @@ type Data struct {
 	// RegisterAt 是上游账号的注册时间（能查到才有），签到时用来区分
 	// 「上游今天还没发每日积分」与「签到了但没落账」。
 	RegisterAt string `json:"register_at,omitempty"`
+
+	// DeviceBound 是上游「可信设备绑定」状态：bound / unbound；空 = 还没查过。
+	//
+	// 它决定这个号到底有没有每日积分资格。2026-11-02 实测 11 个号：9 个
+	// unbound（reason=session_without_bound_device）的**从来没拿到过一次**
+	// daily_grant，2 个 bound 的每天都有 300。裸 token / 手机号导入的号都不带
+	// 绑定态，所以面板以前报的「上游未开通」是误导——真正的原因是没绑设备。
+	DeviceBound string `json:"device_bound,omitempty"`
+	// DeviceCheckedAt 是上一次查 DeviceBound 的时刻（RFC3339），用于 TTL 复用，
+	// 免得每轮签到都对每个号打一次 user_info。
+	DeviceCheckedAt string `json:"device_checked_at,omitempty"`
 }
 
 // Auth 是归一化后的账号凭证。
@@ -406,6 +417,10 @@ func buildAuth(payload map[string]any) (*Auth, error) {
 		CreditAt:   text(payload, "credit_at"),
 		CheckedIn:  text(payload, "checked_in"),
 		ImportedAt: text(payload, "imported_at"),
+		// 设备绑定态同理：不还原就得每轮签到重新问一次上游，
+		// 而且重启后面板会把「已知 unbound 的号」重新显示成「待定」。
+		DeviceBound:     text(payload, "device_bound"),
+		DeviceCheckedAt: text(payload, "device_checked_at"),
 	}}
 	if a.ExpiresAt == 0 {
 		a.ExpiresAt = JWTExpiry(access)

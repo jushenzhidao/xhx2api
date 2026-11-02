@@ -78,6 +78,13 @@ tag 与 `latest`（默认分支）。
 | 新号起始额度 | **9000 分**（注册礼 3000 自动 + 桌面端 3000 + 移动端 3000，后两笔入池即领） | `panel.claimWelcome` |
 | 移动端奖励别等签到 | 实测注册当天就能领（6000→9000）；以前只挂在签到流程里，新号要等下一个时段 | `panel.claimWelcome` |
 | 签到 `ineligible` 只能给「注册已过一天且流水从无 `daily_grant`」的号 | 新号当天 bills 里必然一条 `daily_grant` 都没有，先判「从来没有」就会把刚注册几小时的号报成 ineligible（2026-10-29 实测：手机号新号 17:07 注册、17:15 报「历史上从未获得每日积分」）。凭证里通常不带 `register_at`（裸 token / 手机号导入都没有），得用 `upstream.UserCreatedAt` 补一次并落盘；顺序必须是 今天注册→pending 先于 从无→ineligible | `scheduler.registerTime`、`scheduler.CheckinAccount`，测试 `TestCheckinTodayRegisteredIsPending` |
+| 上游 `paging.offset` 是死参数 | `offset>0` 恒返回空数组（offset=1/50/100 全 0 条），`page`/`page_size` 被完全忽略 ⇒ `type=all` **永远只有最近 100 条**。重度账号一天几十上百条消费，100 条只覆盖 1~1.5 天 | `client.BillsQuery` 注释；判签到改用 `BillsIncomeQuery` |
+| 判签到必须用 `type=income` | 只返回发放行，不受 100 条窗口限制（同一号：income 覆盖 10-26→11-02，all 只覆盖 11-01→11-02）。用 all 判会让「10-29/30/31 连拿三天 300 分」的号被判「历史上从未获得」→ 按无资格跳过、永远不再签（2026-11-02 线上实测 7812474） | `upstream.DailyGrant`、`dailyBatchExpiry`、`earliestBatchExpiry`；测试 `TestDailyGrantUsesIncomeQuery` |
+| `POST /login/points/grant` 是纯空操作 | 11 个号 × 5 种身份头（desktop-win/mac/web/app-android/无版本头）全回 `{"granted":false}`，调完 bills 里 `daily_grant` 一条不涨。**它不是发分入口**，别指望「调一下就有分」 | `upstream.CheckinClaim`（只当观测用） |
+| 每日 +300 的发放时点不固定 | 实测出现 00:00 / 00:21 / 00:55 / 09:25 / 13:30 / 14:36，不是「服务端 00:00 定时任务」（旧注释写错了）。所以只能在事后按 bills 观测，不能定时「触发」 | `scheduler` 包注释 |
+| **有没有每日积分由「可信设备绑定」决定** | `user_info.trusted_device.bound`：2026-11-02 实测 11 个号里 9 个 `bound=false`（`reason=session_without_bound_device`）**从来没拿到过一次** `daily_grant`，2 个 `bound=true` 的天天有 300。裸 token / 手机号导入的号都落在 unbound ⇒ 这批号**永远**不会有每日积分，`claim` 再多轮也没用。绑定端点 `/api/web/auth/v1/device*` 全 404（绑定发生在登录流程内），代码侧补不了 | `upstream.UserProfile`、`scheduler.profile`、`auth.Data.DeviceBound`；测试 `TestCheckinUnboundDeviceReportsUnbound` |
+| 未绑设备不能记「失败」也不能记「上游未开通」 | 报 `unbound` + 面板「未绑设备」标签，批量签到归 **Skipped**（归 Failed 会让面板每天一条红字，把真正的网络/凭证错误淹掉）。文案要说清「去官方客户端登录一次完成绑定」 | `scheduler.CheckinAccount`/`checkinAll`、`panel/app.js`；测试 `TestCheckinUnboundCountedAsSkipped` |
+| 设备态查不到 ≠ 无资格 | `user_info` 打不通且无缓存时必须报 `pending`（待定），不能退回 `ineligible`——把网络抖动说成账号无资格是谎报 | `scheduler.profile` 的 `known` 返回值；测试 `TestCheckinDeviceUnknownStaysPending` |
 | 登录类错误以 HTTP 400 + 信封 code 返回 | 不能先看状态码，否则业务码被吞，面板只剩「http 400」看不懂 | `upstream.smsCall` / `smsBusinessError` |
 | 上游 `visible:false` | 3 个 `raccoon-*` 全标 false，但可调用（默认模型 `raccoon-8c4485` 就是其中之一）。**不能按它过滤 /v1/models**，否则客户端看不到默认模型 | `server.ExcludeUpstreamHidden`（零值=全列）、`models.include_upstream_hidden` |
 | `raccoon-chat-ml-5-5` | 不在目录里，但实测 HTTP 200；默认别名 `gpt-4o`/`claude-*` 指向它。模型页把它列为「目录外」 | `panel.models` 的 `orphans` |

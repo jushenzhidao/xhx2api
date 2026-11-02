@@ -631,6 +631,15 @@ func mergeExisting(account *auth.Auth, existing *auth.Auth) {
 	if account.RegisterAt == "" {
 		account.RegisterAt = snap.RegisterAt
 	}
+	// 设备绑定态也是「查询结果」：覆盖导入（重新登录/重贴 token）时新对象里
+	// 恒为空，不沿用就等于把一个已知 unbound 的号打回「未知」，
+	// 下一次签到又要多打一次 user_info，面板也会白闪一屏「未签」。
+	if account.DeviceBound == "" {
+		account.DeviceBound = snap.DeviceBound
+	}
+	if account.DeviceCheckedAt == "" {
+		account.DeviceCheckedAt = snap.DeviceCheckedAt
+	}
 }
 
 // claimWelcome 新号入池就领一次性奖励（桌面端登录 + 移动端登录）。

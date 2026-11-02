@@ -112,7 +112,10 @@ type Entry struct {
 	ImportedAt    string  `json:"imported_at,omitempty"`
 	FilePath      string  `json:"file,omitempty"`
 	HasRefresh    bool    `json:"has_refresh"`
-	Realm         string  `json:"realm"`
+	// DeviceBound 是上游可信设备绑定态：bound / unbound / ""（还没查过）。
+	// 只有 bound 的号才会拿到每日积分，是「签到一直没分」的唯一解释。
+	DeviceBound string `json:"device_bound,omitempty"`
+	Realm       string `json:"realm"`
 }
 
 // Counts 是池的汇总计数（/status 与面板总览）。
@@ -755,7 +758,8 @@ func (p *Pool) List() []Entry {
 			Weight:    round2(p.weightOf(st, now)),
 			ExpiresAt: snap.ExpiresAt, ImportedAt: snap.ImportedAt,
 			FilePath: a.FilePath, HasRefresh: snap.RefreshToken != "",
-			Realm: auth.RealmCN,
+			DeviceBound: snap.DeviceBound,
+			Realm:       auth.RealmCN,
 		}
 		out = append(out, entry)
 	}

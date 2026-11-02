@@ -278,6 +278,32 @@ func TestDailyGrantIneligible(t *testing.T) {
 	}
 }
 
+// 签到判定必须走 type=income。
+//
+// 回归的是 2026-11-02 线上实测的一个谎报：上游 paging.offset 是死参数，
+// type=all 只会返回最近 100 条；重度账号一天几十上百条消费，把 100 条窗口
+// 压到只剩 1.5 天，于是 10-29~10-31 连续三天拿到 daily_grant 的号被报成
+// 「历史上从未获得每日积分」，直接按无资格跳过、永远不再签。
+func TestDailyGrantUsesIncomeQuery(t *testing.T) {
+	var gotQuery string
+	c, _ := fakeUpstream(t, map[string]http.HandlerFunc{
+		"/points/bills": func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.RawQuery
+			fmt.Fprint(w, `{"code":0,"data":{"items":[]}}`)
+		},
+	})
+	a := &auth.Auth{Data: auth.Data{UID: "u", AccessToken: "tok"}}
+	if _, _, err := c.DailyGrant(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(gotQuery, "type=income") {
+		t.Fatalf("判签到必须查 type=income（不受消费流水截断），实际 query = %q", gotQuery)
+	}
+	if strings.Contains(gotQuery, "type=all") {
+		t.Fatalf("type=all 的 100 条窗口会把历史 daily_grant 挤掉，实际 query = %q", gotQuery)
+	}
+}
+
 func TestRefreshSingleFlight(t *testing.T) {
 	var hits atomic.Int64
 	c, _ := fakeUpstream(t, map[string]http.HandlerFunc{

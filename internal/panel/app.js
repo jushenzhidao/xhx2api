@@ -456,6 +456,7 @@
       st.text, st.cls, st.tip || "", a.cooldown_note || "", a.last_error || "",
       a.in_flight || 0, a.total || 0, a.success || 0, a.avg_latency_ms || 0,
       agoBucket, a.has_refresh ? 1 : 0, a.disabled ? 1 : 0, a.paused ? 1 : 0,
+      a.device_bound || "",
     ].join("\u0001");
   }
 
@@ -465,7 +466,12 @@
     const total = a.total || 0;
     const rate = total ? ((a.success / total) * 100).toFixed(0) + "%" : "-";
     const signed = a.checked_in === todayStr();
-    const checkin = signed ? `<span class="tag ok">已签</span>` : `<span class="tag">未签</span>`;
+    // 未绑设备的号上游根本不发每日积分：显示「无资格」而不是灰着的「未签」，
+    // 否则用户会一直点签到、一直没反应，误以为是网关坏了。
+    const checkin = signed ? `<span class="tag ok">已签</span>`
+      : a.device_bound === "unbound"
+        ? `<span class="tag warn" title="上游只给已绑定可信设备的账号发每日积分；需在官方客户端登录一次完成绑定">未绑设备</span>`
+        : `<span class="tag">未签</span>`;
     // 积分条：剩余 / 池内最高。表达的是「这个号还剩多少额度」的绝对量，
     // 基准取全池最大值、不跟筛选走——否则同一个号切筛选前后百分比会变，
     // 「筛到只剩低分号时显示满格」会被误读成额度健康。
@@ -491,7 +497,7 @@
     return `<tr data-uid="${esc(a.uid)}">
       <td class="who" data-label="账号">
         <div class="acct-name">${esc(a.nickname || a.uid)}</div>
-        <div class="uid">${esc(a.uid)}${a.has_refresh ? "" : " · 无续期令牌"}</div>
+        <div class="uid">${esc(a.uid)}${a.has_refresh ? "" : " · 无续期令牌"}${a.device_bound === "unbound" ? " · 未绑设备" : ""}</div>
       </td>
       <td class="cred-cell" data-label="积分" title="剩余 ${esc(fmtNum(a.credits))}（池内最高 ${esc(fmtNum(maxCred))}）">
         <div class="n">${fmtNum(a.credits)}</div>
@@ -702,6 +708,9 @@
     const results = o.scheduler.results || {};
     const rows = [
       ["签到时点", (cfg.CheckinHours || []).map((h) => h + ":00").join(" / ") + (cfg.CheckinEnabled ? "" : "（已关闭）")],
+      // 说清楚「签到」到底做什么：它不是发分入口（grant 恒幂等空操作），
+      // 而是观测当天有没有 daily_grant 到账。不写这句会被当成「点了就该加分」。
+      ["签到做什么", "观测当日 daily_grant 是否到账（发放由上游按天触发，时点不固定）"],
       ["保活时点", (cfg.KeepaliveHours || []).map((h) => h + ":00").join(" / ") + (cfg.KeepaliveEnabled ? "" : "（已关闭）")],
       ["余额刷新", (cfg.BalanceRefreshMinutes || 0) + " 分钟一次"],
       ["含已禁用账号", cfg.IncludeDisabled ? "是" : "否"],
@@ -1441,7 +1450,10 @@
     try {
       if (act === "checkin") {
         const r = await api(`/panel/api/accounts/${encodeURIComponent(uid)}/checkin`, { method: "POST" });
-        toast(`签到：${r.status} — ${r.message}`, r.status === "failed" ? "bad" : "ok");
+        // 三档而不是两档：unbound / pending 是「上游的状态」，不是这次操作失败。
+        // 全用绿色会显得「签到成功」；全用红色又会让人来查网关。
+        const kind = r.status === "failed" ? "bad" : (r.status === "ok" || r.status === "already") ? "ok" : "warn";
+        toast(`签到：${r.status} — ${r.message}`, kind);
       } else if (act === "balance") {
         const r = await api(`/panel/api/accounts/${encodeURIComponent(uid)}/balance`, { method: "POST" });
         toast(`余额 ${fmtNum(r.remain)} 分（每日 ${fmtNum(r.daily)} / 奖励 ${fmtNum(r.reward)}）`, "ok");

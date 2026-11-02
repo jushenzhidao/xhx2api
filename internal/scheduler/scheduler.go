@@ -2,13 +2,18 @@
 //
 // 几条来自上游实测的结论，直接决定了这里的判定口径：
 //
-//  1. **每日 +300 是服务端 00:00（东八区）自动发的**，不存在「调接口就发分」的
-//     客户端开关。grant 接口是登录弹窗式的手动领取，领过回 granted:false。
-//     所以「签到成功」以 bills 流水里当天有 daily_grant 为准，不是看返回码。
-//  2. **新号当天没有 daily_grant 是正常的**：发放是定时任务，当天注册的号要等
-//     次日首批。报「签到失败」是谎报，要单独识别成「待发放」。
-//  3. **有的号压根没有每日积分资格**（bills 里从来只有 reward_grant）。这种号
-//     再怎么领也不会有，同样不该记成失败。
+//  1. **每日 +300 由上游按天发放，但发放时点不固定**——2026-11-02 抓到的实际时刻
+//     有 00:00 / 00:21 / 00:55 / 09:25 / 13:30 / 14:36，并不是「服务端 00:00 定时
+//     任务」。也不存在「调接口就发分」的客户端开关：grant 接口恒回 granted:false，
+//     调完 bills 里一条不涨（11 个号 × 5 种身份头组合全实测过），是纯幂等空操作。
+//     所以「签到成功」只能以 bills 流水里当天有 daily_grant 为准，不看返回码。
+//  2. **新号当天没有 daily_grant 是正常的**：发放要等次日首批。
+//     报「签到失败」是谎报，要单独识别成「待发放」。
+//  3. **有的号压根没有每日积分资格**，根因是上游没给它绑「可信设备」
+//     （user_info.trusted_device.bound=false，reason=session_without_bound_device）。
+//     2026-11-02 实测：11 个号里 9 个 unbound 的全部从来没过 daily_grant，
+//     2 个 bound 的天天都有 300。这种号再怎么领也不会有，不该记成失败。
+//     裸 token / 手机号导入的号都落在 unbound，得去官方客户端登录一次才可能绑上。
 //  4. **保活只续期，不做任何业务动作**。上游对非官方客户端的识别有一部分来自
 //     行为模式，保活越「像人」越好——只续 token 是最小足迹。
 package scheduler
@@ -187,9 +192,11 @@ func (s *Scheduler) markIfNew(job, key string) bool {
 type CheckinOutcome struct {
 	UID      string `json:"uid"`
 	Nickname string `json:"nickname"`
-	Status   string `json:"status"` // ok / already / pending / ineligible / failed
+	Status   string `json:"status"` // ok / already / pending / unbound / ineligible / failed
 	Credits  int64  `json:"credits"`
 	Message  string `json:"message"`
+	// DeviceBound 是上游可信设备绑定态：bound / unbound / ""（没取到）。
+	DeviceBound string `json:"device_bound,omitempty"`
 }
 
 // CheckinAccount 对单个账号执行签到。
@@ -198,9 +205,10 @@ type CheckinOutcome struct {
 //
 //	already    今天已有 daily_grant（最理想，不用做任何事）
 //	ok         本次 claim 后确认到账
-//	pending    新号/上游还没发，今天再等等
-//	ineligible 上游从未给它发过每日积分
-//	failed     真的失败了
+//	pending    上游今天还没发（新号 / 未到发放时点 / 设备状态没取到）
+//	unbound    没绑可信设备 ⇒ 上游不会发每日积分，去官方客户端登录一次才可能绑上
+//	ineligible 绑了设备却从未发过每日积分（极少见，保留兜底）
+//	failed     真的失败了（网络 / 凭证问题）
 func (s *Scheduler) CheckinAccount(ctx context.Context, a *auth.Auth) CheckinOutcome {
 	out := CheckinOutcome{UID: a.UID, Nickname: a.Snapshot().Nickname}
 	checked, credits, err := s.up.CheckinStatus(ctx, a)
@@ -238,42 +246,102 @@ func (s *Scheduler) CheckinAccount(ctx context.Context, a *auth.Auth) CheckinOut
 		out.Message = fmt.Sprintf("领取失败：%v；流水查询也失败：%v", claimErr, billErr)
 		return out
 	}
-	// 今天注册的号：发放是次日 00:00 的首批，此刻 bills 里必然一条 daily_grant 都没有。
-	// 这条必须排在「从来没有」前面——否则刚注册几小时的号会被报成 ineligible，
-	// 那句「历史上从未获得每日积分」对它就是谎报（实测踩过：手机号新号报 ineligible）。
-	if reg := s.registerTime(ctx, a); !reg.IsZero() &&
+	// 注册时间与设备绑定态一起拿（一次 user_info，带落盘缓存）。
+	prof, known := s.profile(ctx, a)
+	out.DeviceBound = prof.state()
+	// 今天注册的号：bills 里必然一条 daily_grant 都没有，那是还没到发放时点。
+	// 这条必须排在「从来没有」前面——否则刚注册几小时的号会被报成无资格
+	// （实测踩过：手机号新号 17:07 注册、17:15 报「历史上从未获得」）。
+	if reg := prof.createdAt; !reg.IsZero() &&
 		reg.In(shanghai()).Format("2006-01-02") == time.Now().In(shanghai()).Format("2006-01-02") {
 		out.Status = "pending"
-		out.Message = "账号今天注册，每日积分次日 00:00 首批发放"
+		out.Message = "账号今天注册，每日积分次日首批发放"
 		return out
 	}
 	if billErr == nil && !ever {
-		// 注册已过一天仍从未有过 daily_grant：这个号确实没有每日积分资格（不是失败）。
+		if !known {
+			// 设备态没取到就不能下「无资格」的结论：那是猜的。待定比谎报好。
+			out.Status = "pending"
+			out.Message = "历史上没有发放记录，且可信设备状态未取到，稍后重试"
+			return out
+		}
+		if prof.DeviceState == "unbound" {
+			// 实测根因：没绑可信设备上游就不发每日积分，claim 再多轮也不会到账。
+			// 这不是失败，也不是「上游未开通」，得让用户看到真正该做的事。
+			out.Status = "unbound"
+			out.Message = "账号未绑定可信设备，上游不会发放每日积分；需在官方客户端登录一次完成设备绑定"
+			return out
+		}
 		out.Status = "ineligible"
-		out.Message = "该账号历史上从未获得每日积分（上游未开通），无需签到"
+		out.Message = "该账号已绑设备但历史上从未获得每日积分，无需签到"
 		return out
 	}
 	out.Status = "pending"
-	out.Message = "上游今日尚未发放（服务端 00:00 定时任务），稍后再试"
+	out.Message = "上游今日尚未发放，稍后再试"
 	return out
 }
 
-// registerTime 取账号的上游注册时间。
+// deviceProfile 是账号上游资料的本地视图（含「这份资料新不新」）。
+type deviceProfile struct {
+	createdAt   time.Time
+	DeviceBound bool
+	DeviceState string
+}
+
+// state 归一成 bound / unbound / ""（未知），供面板直接展示。
+func (p deviceProfile) state() string { return p.DeviceState }
+
+// deviceCacheTTL 是设备绑定态的复用时长。
 //
-// 凭证里通常没有这个字段（裸 token 导入、手机号登录都不带 register_at），
-// 这时向上游 user_info 问一次并落盘——只问一次，之后走本地缓存。
-// 拿不到就返回零值，调用方按「老号」处理（宁可报 ineligible 也不谎报 pending）。
-func (s *Scheduler) registerTime(ctx context.Context, a *auth.Auth) time.Time {
-	if reg := a.RegisterTime(); !reg.IsZero() {
-		return reg
+// 绑不绑设备是低频变化（用户去官方客户端登录一次才会变），但签到是每天跑的，
+// 不缓存就等于每天给每个号多打一次 user_info。12 小时：一天最多两次。
+const deviceCacheTTL = 12 * time.Hour
+
+// profile 取账号的上游资料，带落盘缓存。
+//
+// 返回的 known=false 表示「确实不知道设备态」（查询失败且没有可用缓存），
+// 调用方据此走「待定」而不是「无资格」——把网络抖动说成账号无资格是谎报。
+func (s *Scheduler) profile(ctx context.Context, a *auth.Auth) (prof deviceProfile, known bool) {
+	snap := a.Snapshot()
+	prof.createdAt = a.RegisterTime()
+	prof.DeviceBound = snap.DeviceBound == "bound"
+	prof.DeviceState = snap.DeviceBound
+
+	cached := snap.DeviceBound != "" && snap.DeviceCheckedAt != ""
+	if cached {
+		if at, err := time.Parse(time.RFC3339, snap.DeviceCheckedAt); err == nil {
+			cached = time.Since(at) < deviceCacheTTL
+		} else {
+			cached = false
+		}
 	}
-	t, ok := s.up.UserCreatedAt(ctx, a)
-	if !ok {
-		return time.Time{}
+	if cached && !prof.createdAt.IsZero() {
+		return prof, true
 	}
-	a.SetRegisterAt(t)
+
+	remote, err := s.up.UserProfile(ctx, a)
+	if err != nil {
+		// 查询失败：有旧缓存就继续用旧的（但 known 仍为 true，因为知道的是事实），
+		// 没缓存就承认不知道。
+		return prof, snap.DeviceBound != ""
+	}
+	if !remote.CreatedAt.IsZero() {
+		prof.createdAt = remote.CreatedAt
+	}
+	prof.DeviceBound = remote.DeviceBound
+	prof.DeviceState = remote.DeviceState
+	if prof.DeviceState == "" {
+		prof.DeviceState = map[bool]string{true: "bound", false: "unbound"}[remote.DeviceBound]
+	}
+	a.Apply(func(d *auth.Data) {
+		if !remote.CreatedAt.IsZero() {
+			d.RegisterAt = remote.CreatedAt.Format(time.RFC3339)
+		}
+		d.DeviceBound = prof.DeviceState
+		d.DeviceCheckedAt = time.Now().Format(time.RFC3339)
+	})
 	_ = a.SaveAtomic()
-	return t
+	return prof, true
 }
 
 // checkinAll 对全池账号跑一轮签到。
@@ -317,7 +385,10 @@ func (s *Scheduler) checkinAll(ctx context.Context) JobResult {
 				case "ok", "already":
 					result.OK++
 					s.pool.NoteCheckedIn(uid, time.Now())
-				case "pending", "ineligible":
+				case "pending", "ineligible", "unbound":
+					// unbound 归这里而不是 default：没绑设备是账号状态，不是本次
+					// 执行的失败。算进 failed 会让面板每天都有一条红字，
+					// 反而把真正的网络/凭证错误淹掉。
 					result.Skipped++
 				default:
 					result.Failed++

@@ -65,9 +65,25 @@ const (
 	// DefaultClientVersion 是出站 x-client-version 的内置值（v1.1.0 抓包）。
 	DefaultClientVersion = "v1.1.0"
 
-	// BillsQuery 是流水查询串。limit 必须给足：流水按时间倒序，重度使用一天几十条
-	// 消费记录会把今日 +300 的 daily_grant 挤出前 10 条，签到状态就会误判。
+	// BillsQuery 是「全部流水」查询串（含消费行），只用于对账 RecentBills。
+	//
+	// ⚠ 不要拿它判签到：上游的 paging.offset 是死参数（>0 恒返回空数组，
+	// 2026-11-02 实测 offset=1/50/100 全为 0 条），所以 type=all 永远只能看到
+	// 最近 100 条。重度账号这 100 条只覆盖 1~2 天，今日的 daily_grant 会被后面
+	// 的消费行挤出窗口。
 	BillsQuery = "paging.limit=100&type=all&paging.offset=0"
+
+	// BillsIncomeQuery 只取发放类流水（daily_grant / reward_grant / topup）。
+	//
+	// 判签到必须用它，三个理由（2026-11-02 抓包实测）：
+	//  1. 不受消费频率影响：type=income 只返回发放行，一个号一年才 300 多条，
+	//     100 条足够覆盖三个月；type=all 对重度账号只有 1.5 天。
+	//  2. 「历史有没有发过」才判得准：实测 7812474 在 10-29/30/31 各有一次
+	//     daily_grant，但 type=all 的窗口只回溯到 11-01，于是被判成「历史上
+	//     从未获得每日积分」——一个每天 300 分的号被当成无资格号跳过。
+	//  3. 今日判定同样受益：消费密集的号一天能打几十上百条，正午之后的
+	//     type=all 里已经看不到凌晨那条 daily_grant 了。
+	BillsIncomeQuery = "paging.limit=100&type=income"
 )
 
 // 业务码。
