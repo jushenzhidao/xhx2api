@@ -620,7 +620,7 @@ func (c *Client) timeouts() (short, header time.Duration) {
 // 带账号 ⇒ 出口恒定）。否则回落到共享 client——即代理未启用时行为与改造前
 // 完全一致，这也是所有既有测试的前提。
 func (c *Client) clientFor(ctx context.Context, kind clientKind, rawURL string) *http.Client {
-	if uid := accountUID(ctx); uid != "" && c.proxy.usable() && c.proxy.appliesTo(rawURL) {
+	if uid := accountUID(ctx); uid != "" && c.proxy.usableFor(uid, rawURL) {
 		short, header := c.timeouts()
 		total := short
 		if kind == kindImage {
@@ -673,11 +673,26 @@ func (c *Client) do(req *http.Request) (*apiResponse, error) {
 		req.Header.Set("User-Agent", c.currentUA())
 	}
 	resp, err := c.clientFor(req.Context(), kindShort, req.URL.String()).Do(req)
+	if err != nil && req.Context().Err() != nil {
+		return nil, req.Context().Err()
+	}
 	if err != nil {
-		if req.Context().Err() != nil {
-			return nil, req.Context().Err()
-		}
 		c.logProxiedFailure(req.Context(), req.Method, req.URL.Path, 0)
+		var pde *proxyDialError
+		if errors.As(err, &pde) {
+			// 代理这一跳不通时立刻用直连重试一次。
+			//
+			// 供应商常常只开通部分用户名（2026-11-03 实测 11 个里只有 2 个能
+			// 建隧道），而这些账号直连本来是好的。如果这里直接失败，等于
+			// 「引入代理反而把可用性做没了」——比不加代理更糟。
+			if direct, rerr := c.retryDirect(req); rerr == nil {
+				log.Printf("[proxy] 账号=%s 出口不可用，已回落直连 %s %s",
+					accountUID(req.Context()), req.Method, req.URL.Path)
+				resp, err = direct, nil
+			}
+		}
+	}
+	if err != nil {
 		// 代理连不通归 gateway：不罚号、不熔断。代理挂了却去罚账号，
 		// 等于把链路故障放大成「账号全灭」（gateway 只做 15s 短回避）。
 		var pde *proxyDialError
@@ -695,6 +710,24 @@ func (c *Client) do(req *http.Request) (*apiResponse, error) {
 		return nil, &Error{Kind: ErrServer, Status: 502, Msg: "读取小浣熊响应失败"}
 	}
 	return &apiResponse{Status: resp.StatusCode, Body: raw}, nil
+}
+
+// retryDirect 用共享（直连）client 重发同一请求，仅供「代理出口不可用」时回落。
+//
+// 必须重建 body：第一次请求已经把 req.Body 读空了，直接复用会发出空 body，
+// 上游会当成参数错误——比连不上更难排查。http.NewRequestWithContext 对
+// bytes.Reader 会自动挂上 GetBody，所以这里能拿到全新的一份。
+func (c *Client) retryDirect(req *http.Request) (*http.Response, error) {
+	clone := req.Clone(req.Context())
+	if req.GetBody != nil {
+		body, err := req.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		clone.Body = body
+	}
+	clone.Header = req.Header.Clone()
+	return c.httpClient().Do(clone)
 }
 
 // doJSON 发请求：body 非 nil 时按 JSON 序列化，headers 原样写入。
@@ -999,9 +1032,19 @@ func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte, turn
 		var pde *proxyDialError
 		if errors.As(err, &pde) {
 			c.logProxiedFailure(reqCtx, req.Method, req.URL.Path, 0)
-			return nil, 502, nil, &Error{Kind: ErrGateway, Status: 502, Msg: pde.Error()}
+			// 同 do()：出口不通就直连重试，别让一次代理故障变成聊天不可用。
+			if direct, rerr := c.retryDirect(req); rerr == nil {
+				log.Printf("[proxy] 账号=%s 出口不可用，已回落直连 %s %s",
+					a.UID, req.Method, req.URL.Path)
+				resp = direct
+				err = nil
+			} else {
+				return nil, 502, nil, &Error{Kind: ErrGateway, Status: 502, Msg: pde.Error()}
+			}
 		}
-		return nil, 502, nil, &Error{Kind: ErrServer, Status: 502, Msg: "无法连接小浣熊，请检查网络或代理设置"}
+		if err != nil {
+			return nil, 502, nil, &Error{Kind: ErrServer, Status: 502, Msg: "无法连接小浣熊，请检查网络或代理设置"}
+		}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

@@ -197,14 +197,30 @@ type proxyManager struct {
 	egress  map[string]egressEntry
 	// probing 去重并发探测：同一账号同时只查一次出口 IP。
 	probing map[string]bool
+
+	// failedAt 记录「该账号的代理连不通」的时刻，用于临时跳过代理。
+	//
+	// 2026-11-03 线上教训：代理供应商只开通了部分用户名，其余用户名连
+	// 1.1.1.1 都不通（SOCKS5 码 3）。没有这个冷却时，每个请求都要先等一次
+	// 建连超时再失败，9 个账号的积分查询从「直连本来 200」降级成「全部失败」。
+	// 有它以后：失败一次就记下来，冷却期内直接走直连，到期再试一次。
+	failMu   sync.Mutex
+	failedAt map[string]time.Time
 }
+
+// proxyFailCooldown 是代理连不通后「直接走直连」的时长。
+//
+// 5 分钟：够短，代理恢复后能较快重新用上；够长，不至于每个请求都先撞一次
+// 超时。到期后自动再试一次（不是永久放弃）——供应商开通用户名后无需重启。
+const proxyFailCooldown = 5 * time.Minute
 
 func newProxyManager() *proxyManager {
 	return &proxyManager{
 		dialers: map[string]proxy.Dialer{},
 		trs:     map[string]*http.Transport{},
-		egress:  map[string]egressEntry{},
-		probing: map[string]bool{},
+		egress:   map[string]egressEntry{},
+		probing:  map[string]bool{},
+		failedAt: map[string]time.Time{},
 	}
 }
 
@@ -230,6 +246,9 @@ func (m *proxyManager) configure(cfg ProxyConfig) {
 	m.trs = map[string]*http.Transport{}
 	m.egress = map[string]egressEntry{}
 	m.probing = map[string]bool{}
+	m.failMu.Lock()
+	m.failedAt = map[string]time.Time{}
+	m.failMu.Unlock()
 }
 
 // usable 报告当前是否可以走代理。
@@ -237,6 +256,18 @@ func (m *proxyManager) usable() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.cfg.Enabled && m.epErr == nil && m.ep.host != ""
+}
+
+// usableFor 报告「这个账号此刻是否该走代理」：全局启用、作用域命中、
+// 且不在失败冷却窗口里。
+func (m *proxyManager) usableFor(uid, rawURL string) bool {
+	if !m.usable() {
+		return false
+	}
+	if !m.appliesTo(rawURL) {
+		return false
+	}
+	return !m.inFailCooldown(uid)
 }
 
 // appliesTo 判断某 URL 是否该走代理（按当前配置的作用域）。
@@ -315,6 +346,7 @@ func (m *proxyManager) transportFor(uid string, headerTimeout time.Duration) (*h
 	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		conn, derr := m.dialFor(ctx, d, cfg, network, addr)
 		if derr != nil {
+			m.noteDialFailure(uid)
 			// 包成可识别类型：出口不可用和「账号有问题」是两件事，
 			// 混为一谈会让一次代理故障把好号全打进熔断。
 			return nil, &proxyDialError{uid: uid, addr: addr, err: derr}
@@ -329,6 +361,32 @@ func (m *proxyManager) transportFor(uid string, headerTimeout time.Duration) (*h
 	}
 	m.trs[key] = tr
 	return tr, nil
+}
+
+// noteDialFailure 记下「该账号这次经代理没连上」。
+func (m *proxyManager) noteDialFailure(uid string) {
+	m.failMu.Lock()
+	if m.failedAt == nil {
+		m.failedAt = map[string]time.Time{}
+	}
+	m.failedAt[uid] = time.Now()
+	m.failMu.Unlock()
+}
+
+// inFailCooldown 报告该账号是否处于「代理刚失败过、先走直连」的窗口。
+func (m *proxyManager) inFailCooldown(uid string) bool {
+	m.failMu.Lock()
+	defer m.failMu.Unlock()
+	at, ok := m.failedAt[uid]
+	if !ok {
+		return false
+	}
+	if time.Since(at) > proxyFailCooldown {
+		// 过期就地清理：下一个请求会重新尝试代理，代理恢复后自动回归。
+		delete(m.failedAt, uid)
+		return false
+	}
+	return true
 }
 
 // dialFor 做实际拨号（含 DialTimeout）。

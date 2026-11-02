@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -445,5 +446,99 @@ func TestProxyScopeDefaultsToPoints(t *testing.T) {
 	}
 	if (ProxyConfig{Enabled: false, Scope: ProxyScopeAll}).appliesTo("https://x/api/web/points/v1/balance") {
 		t.Fatal("关闭时一律不走代理")
+	}
+}
+
+// 代理不通时必须立刻回落直连，业务不能断。
+//
+// 2026-11-03 线上真实场景：代理供应商只开通了 11 个用户名里的 2 个，其余
+// 回 SOCKS5 码 3。而这些账号直连本来是 200。如果代理失败就直接报错，等于
+// 「为了绕开 IP 风控，反而把 9 个好好的号做成了不可用」——比不加代理更糟。
+func TestProxyDialFailureFallsBackToDirect(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		fmt.Fprintf(w, `{"code":0,"echo":%q}`, string(body))
+	}))
+	defer srv.Close()
+
+	c := New()
+	c.SetProxy(ProxyConfig{
+		Enabled:     true,
+		Template:    "socks5h://u-{account}:pw@127.0.0.1:1",
+		Scope:       ProxyScopeAll,
+		DialTimeout: 300 * time.Millisecond,
+	})
+	a := &auth.Auth{Data: auth.Data{UID: "9200", AccessToken: "t"}}
+
+	// 带 body 的 POST：回落时必须重发 body，否则上游会收到空体
+	resp, err := c.doJSON(context.Background(), a, http.MethodPost, srv.URL+"/x",
+		map[string]any{"k": "v"}, nil)
+	if err != nil {
+		t.Fatalf("代理不通时应回落直连成功，实得: %v", err)
+	}
+	if resp.Status != 200 {
+		t.Fatalf("status = %d", resp.Status)
+	}
+	if !strings.Contains(string(resp.Body), `\"k\":\"v\"`) && !strings.Contains(string(resp.Body), "k") {
+		t.Fatalf("回落直连后 body 丢了: %s", resp.Body)
+	}
+	if hits.Load() != 1 {
+		t.Fatalf("上游应收到 1 次请求，实得 %d", hits.Load())
+	}
+}
+
+// 代理刚失败过的账号要在冷却期内直接走直连，不要每个请求都先撞一次超时。
+//
+// 这决定了「9 个用户名不通」时的实际体验：没有冷却，每次查余额都要先等
+// 一次建连失败；有冷却，第一个请求撞一次，之后都直接走直连。
+func TestProxyFailCooldownSkipsProxy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"code":0}`)
+	}))
+	defer srv.Close()
+
+	// 一个只计数、不服务的端口：accept 后立刻关闭，制造 SOCKS 握手失败
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var attempts atomic.Int64
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			attempts.Add(1)
+			conn.Close()
+		}
+	}()
+
+	c := New()
+	c.SetProxy(ProxyConfig{
+		Enabled:     true,
+		Template:    "socks5h://u-{account}:pw@" + ln.Addr().String(),
+		Scope:       ProxyScopeAll,
+		DialTimeout: 300 * time.Millisecond,
+	})
+	a := &auth.Auth{Data: auth.Data{UID: "9201", AccessToken: "t"}}
+
+	for i := 0; i < 3; i++ {
+		if _, derr := c.doJSON(context.Background(), a, http.MethodGet, srv.URL+"/x", nil, nil); derr != nil {
+			t.Fatalf("第 %d 次应回落直连成功: %v", i+1, derr)
+		}
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("冷却期内只该撞一次代理，实际建连 %d 次", got)
+	}
+	if !c.proxy.inFailCooldown("9201") {
+		t.Fatal("失败后应处于冷却窗口")
+	}
+	// 别的账号不受影响：冷却按账号隔离
+	if c.proxy.inFailCooldown("9202") {
+		t.Fatal("冷却不该跨账号生效")
 	}
 }
