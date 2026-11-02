@@ -89,6 +89,13 @@ func (c *Client) BindDevice(ctx context.Context, a *auth.Auth) (string, error) {
 	headers := c.clientIDHeaders()
 	// 官方客户端在这四个头上带的是绑定专用的写法：X-Client-Device-ID 必带，
 	// 平台不带 -x64 后缀。服务端显然用它们做一致性校验，所以照抄。
+	//
+	// ⚠️ 必须先删掉小写那份再写大写：clientIDHeaders() 用的是小写键，
+	// 而 http.Header.Set 会把 `x-client-platform` 和 `X-Client-Platform`
+	// 归一到同一个规范键 —— 两个都留着时，map 遍历顺序随机，
+	// 实际发出去的值就随机（测试里抓到过一次发成 desktop-windows-x64）。
+	delete(headers, "x-client-platform")
+	delete(headers, "x-client-version")
 	headers["X-Client-Platform"] = deviceBindPlatform
 	headers["X-Client-Device-ID"] = deviceID
 	headers["X-Client-Version"] = c.effectiveVersion()
