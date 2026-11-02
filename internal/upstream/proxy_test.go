@@ -542,3 +542,81 @@ func TestProxyFailCooldownSkipsProxy(t *testing.T) {
 		t.Fatal("冷却不该跨账号生效")
 	}
 }
+
+// 作用域必须能热更新：改 scope 不需要重启。
+//
+// 用户会用它应对「封禁从积分域扩散到聊天域」——等重启才能生效，那个窗口里
+// 聊天是全挂的。注意 configure 里的 `same` 只看 Enabled/Template（决定是否
+// 重建连接池），Scope 走的是「直接赋新 cfg」，所以改作用域不该丢连接池。
+func TestProxyScopeHotReload(t *testing.T) {
+	c := New()
+	c.SetProxy(ProxyConfig{
+		Enabled:  true,
+		Template: "socks5h://u-{account}:pw@127.0.0.1:9",
+		Scope:    ProxyScopePoints,
+	})
+	ctxURL := "https://xiaohuanxiong.com/api/web/llm/v2/chat/completions"
+	ptURL := "https://xiaohuanxiong.com/api/web/points/v1/balance"
+
+	if c.proxy.appliesTo(ctxURL) {
+		t.Fatal("初始 points 作用域下聊天不该走代理")
+	}
+	if !c.proxy.appliesTo(ptURL) {
+		t.Fatal("积分应当走代理")
+	}
+
+	// 热切成 all
+	c.SetProxy(ProxyConfig{
+		Enabled:  true,
+		Template: "socks5h://u-{account}:pw@127.0.0.1:9",
+		Scope:    ProxyScopeAll,
+	})
+	if !c.proxy.appliesTo(ctxURL) {
+		t.Fatal("切成 all 后聊天也应走代理（热更新没生效）")
+	}
+	if !c.proxy.appliesTo(ptURL) {
+		t.Fatal("all 下积分仍应走代理")
+	}
+
+	// 切回来
+	c.SetProxy(ProxyConfig{
+		Enabled:  true,
+		Template: "socks5h://u-{account}:pw@127.0.0.1:9",
+		Scope:    ProxyScopePoints,
+	})
+	if c.proxy.appliesTo(ctxURL) {
+		t.Fatal("切回 points 后聊天不该再走代理")
+	}
+}
+
+// 改作用域不该把已建好的连接池丢掉（否则切一次要重连全部账号）。
+func TestProxyScopeChangeKeepsTransport(t *testing.T) {
+	c := New()
+	base := ProxyConfig{Enabled: true, Template: "socks5h://u-{account}:pw@127.0.0.1:9", Scope: ProxyScopePoints}
+	c.SetProxy(base)
+	before, err := c.proxy.transportFor("9300", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base.Scope = ProxyScopeAll
+	c.SetProxy(base)
+	after, err := c.proxy.transportFor("9300", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after {
+		t.Fatal("只改作用域不该重建 transport（白白丢掉连接池）")
+	}
+
+	// 但改模板必须重建：旧连接绑的是旧出口
+	base.Template = "socks5h://other-{account}:pw@127.0.0.1:9"
+	c.SetProxy(base)
+	rebuilt, err := c.proxy.transportFor("9300", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rebuilt == before {
+		t.Fatal("改模板必须重建 transport，否则还在用旧出口")
+	}
+}
