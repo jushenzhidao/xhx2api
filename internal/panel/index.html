@@ -92,6 +92,7 @@
               <button class="btn" data-action="checkin_all">全部签到</button>
               <button class="btn" data-action="keepalive_all">保活续期</button>
               <button class="btn" data-action="balance_all">刷新余额</button>
+              <button class="btn" data-action="bind_device_all" title="给没有可信设备的号补绑。上游只给 bound=true 的号发每日积分">补绑设备</button>
               <button class="btn primary" id="btn-open-import">添加账号</button>
             </div>
           </div>
@@ -365,13 +366,14 @@
         <div class="field-row">
           <label class="hint" for="sms-channel" style="white-space:nowrap">登录通道</label>
           <select id="sms-channel">
-            <option value="desktop">桌面端（建可信设备，推荐）</option>
-            <option value="iam">IAM（网页通道，不建设备）</option>
+            <option value="iam">IAM（网页通道，默认）</option>
+            <option value="desktop">桌面端（会带回 refresh_token）</option>
           </select>
         </div>
-        <p class="hint">只有走<b>桌面端</b>通道，上游才会在登录流程里创建可信设备
-          （<code>trusted_device.bound</code>）。IAM 通道不建，那种号永远拿不到每日 300 分。
-          改动前导入的号已是 unbound，需要用这个通道<b>重新登录一次</b>才能补上。</p>
+        <p class="hint">两条通道的验证码不通用，发码用哪条、验码就得用哪条（这里会自动配对）。
+          桌面端通道额外带回 <code>refresh_token</code>，票到期前可自动续期。</p>
+        <p class="hint"><b>可信设备与通道无关</b>：导入后在账号池点「补绑设备」即可，
+          上游只给 <code>trusted_device.bound=true</code> 的号发每日 300 分。</p>
         <p class="hint"><b>实测这个字段是死的</b>：填了上游既不落库（新号 <code>registration_attribution</code>
           仍是空对象），也不给双方任何积分。留着只为上游恢复该功能时能直接用。</p>
         <p class="hint" id="sms-status"></p>

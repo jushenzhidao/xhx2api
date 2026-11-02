@@ -142,6 +142,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/priority", p.withAuth(p.accountPriority))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/bind-device", p.withAuth(p.accountBindDevice))
+	p.mux.HandleFunc("POST /panel/api/accounts/bind-device-all", p.withAuth(p.accountsBindDeviceAll))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/bills", p.withAuth(p.accountBills))
 	p.mux.HandleFunc("GET /panel/api/points", p.withAuth(p.pointsOverview))
@@ -789,6 +791,81 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, outcome)
+}
+
+// accountBindDevice 给单个账号补绑可信设备。
+//
+// 为什么需要这个入口：上游把「有没有每日积分资格」绑在 trusted_device.bound 上，
+// 而 device_id 只能由服务端通过 /devices_current_bind 下发。接码导入的号
+// 天生没有设备（bound=false），这种号**永远**拿不到每日积分。
+// 以前只能在官方客户端登录一次，现在在这里点一下就能补上。
+func (p *Panel) accountBindDevice(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		writeErr(w, http.StatusNotFound, "账号不存在")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+	defer cancel()
+	deviceID, err := p.cfg.Upstream.BindDevice(ctx, a)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	// 绑定成功后上游的 device_id 只在这里见过一次，落盘失败就等于白绑
+	// （下次会换新的 client_device_id，反而制造「不断声明新设备」）。
+	a.DeviceCheckedAt = time.Now().Format(time.RFC3339)
+	if serr := a.SaveAtomic(); serr != nil {
+		log.Printf("WARN: 账号 %s 绑定设备后落盘失败（重启后需重新绑定）: %v", uid, serr)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"uid": uid, "device_id": deviceID, "device_bound": a.DeviceBound,
+	})
+}
+
+// accountsBindDeviceAll 给所有「还没有可信设备」的账号补绑。
+//
+// 只处理 unbound 与未查过的：已 bound 的号重复调没有意义，还会平白多几条
+// 上游请求。串行 + 每个 40s 上限：并发绑一串设备本身就是可疑行为。
+func (p *Panel) accountsBindDeviceAll(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	defer cancel()
+
+	type result struct {
+		UID      string `json:"uid"`
+		OK       bool   `json:"ok"`
+		DeviceID string `json:"device_id,omitempty"`
+		Error    string `json:"error,omitempty"`
+		Skipped  bool   `json:"skipped,omitempty"`
+	}
+
+	var (
+		results []result
+		okCount int
+	)
+	for _, uid := range p.cfg.Pool.UIDs() {
+		a := p.cfg.Pool.AuthByUID(uid)
+		if a == nil {
+			continue
+		}
+		if a.DeviceBound == "bound" {
+			results = append(results, result{UID: uid, Skipped: true})
+			continue
+		}
+		deviceID, err := p.cfg.Upstream.BindDevice(ctx, a)
+		if err != nil {
+			results = append(results, result{UID: uid, Error: err.Error()})
+			continue
+		}
+		a.DeviceCheckedAt = time.Now().Format(time.RFC3339)
+		if serr := a.SaveAtomic(); serr != nil {
+			log.Printf("WARN: 账号 %s 绑定设备后落盘失败: %v", uid, serr)
+		}
+		results = append(results, result{UID: uid, OK: true, DeviceID: deviceID})
+		okCount++
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": okCount, "results": results})
 }
 
 func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {

@@ -83,6 +83,12 @@ type Data struct {
 	// daily_grant，2 个 bound 的每天都有 300。裸 token / 手机号导入的号都不带
 	// 绑定态，所以面板以前报的「上游未开通」是误导——真正的原因是没绑设备。
 	DeviceBound string `json:"device_bound,omitempty"`
+	// ClientDeviceID 是「这台设备」的稳定标识（UUIDv4 形态）。
+	//
+	// 绑可信设备时必须带上它，而且**必须持久化后复用**：每次绑都换一个 UUID
+	// 等于同一账号不断声明新设备，正是风控最敏感的模式。首次绑定时生成，
+	// 之后所有绑定/心跳都用同一个值。
+	ClientDeviceID string `json:"client_device_id,omitempty"`
 	// DeviceCheckedAt 是上一次查 DeviceBound 的时刻（RFC3339），用于 TTL 复用，
 	// 免得每轮签到都对每个号打一次 user_info。
 	DeviceCheckedAt string `json:"device_checked_at,omitempty"`
@@ -421,6 +427,9 @@ func buildAuth(payload map[string]any) (*Auth, error) {
 		// 而且重启后面板会把「已知 unbound 的号」重新显示成「待定」。
 		DeviceBound:     text(payload, "device_bound"),
 		DeviceCheckedAt: text(payload, "device_checked_at"),
+		// client_device_id 也必须还原：换了它等于换了台机器，
+		// 上游会把「同一账号不断声明新设备」当成异常。
+		ClientDeviceID: text(payload, "client_device_id"),
 	}}
 	if a.ExpiresAt == 0 {
 		a.ExpiresAt = JWTExpiry(access)

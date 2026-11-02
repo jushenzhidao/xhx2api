@@ -1481,12 +1481,24 @@
   $$("[data-action]").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const action = btn.dataset.action;
-      const names = { checkin_all: "全部签到", keepalive_all: "保活续期", balance_all: "刷新余额" };
+      const names = { checkin_all: "全部签到", keepalive_all: "保活续期", balance_all: "刷新余额", bind_device_all: "补绑可信设备" };
       if (!confirm(`执行「${names[action] || action}」？账号多时可能需要一两分钟。`)) return;
       btn.disabled = true;
       const old = btn.textContent;
       btn.textContent = "执行中…";
       try {
+        // 补绑设备的返回是 {ok, results[]}，没有 skipped/failed 计数，
+        // 单独走一条分支，免得把「跳过 0 / 失败 0」当成什么都没做。
+        if (action === "bind_device_all") {
+          const r = await api("/panel/api/accounts/bind-device-all", { method: "POST" });
+          const list = r.results || [];
+          const skipped = list.filter((x) => x.skipped).length;
+          const failed = list.filter((x) => x.error).length;
+          toast(`补绑完成：成功 ${r.ok || 0} / 已绑跳过 ${skipped} / 失败 ${failed}`, failed ? "warn" : "ok");
+          if (failed) console.warn("补绑失败详情:", list.filter((x) => x.error));
+          await loadOverview();
+          return;
+        }
         const r = await api(`/panel/api/${action}`, { method: "POST" });
         toast(`完成：成功 ${r.ok || 0} / 跳过 ${r.skipped || 0} / 失败 ${r.failed || 0}`, r.failed ? "warn" : "ok");
         await loadOverview();
@@ -1853,9 +1865,9 @@
         phone,
         captcha_param: captchaParam,
         inviter_user_id: ($("#sms-inviter").value || "").trim(),
-        // 默认 desktop：只有这条通道会创建可信设备，IAM 不建，
-        // 而 unbound 的号永远拿不到每日积分。
-        login_via: (($("#sms-channel") && $("#sms-channel").value) || "desktop"),
+        // 默认 iam：这条通道已验证可用。可信设备不靠通道创建，
+        // 导入后由「补绑设备」显式调 /devices_current_bind 完成。
+        login_via: (($("#sms-channel") && $("#sms-channel").value) || "iam"),
       },
     });
     // IAM 通道发码会返回 verification_id，登录时必须带回去。
@@ -1892,7 +1904,7 @@
           phone, code,
           verification_id: state.sms.verificationID || "",
           inviter_user_id: ($("#sms-inviter").value || "").trim(),
-          login_via: (($("#sms-channel") && $("#sms-channel").value) || "desktop"),
+          login_via: (($("#sms-channel") && $("#sms-channel").value) || "iam"),
         },
       });
       toast(`${r.updated ? "已更新" : "已导入"} ${r.account.nickname || r.account.uid}`, "ok");
