@@ -216,8 +216,8 @@ const proxyFailCooldown = 5 * time.Minute
 
 func newProxyManager() *proxyManager {
 	return &proxyManager{
-		dialers: map[string]proxy.Dialer{},
-		trs:     map[string]*http.Transport{},
+		dialers:  map[string]proxy.Dialer{},
+		trs:      map[string]*http.Transport{},
 		egress:   map[string]egressEntry{},
 		probing:  map[string]bool{},
 		failedAt: map[string]time.Time{},
