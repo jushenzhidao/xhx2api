@@ -620,3 +620,57 @@ func TestProxyScopeChangeKeepsTransport(t *testing.T) {
 		t.Fatal("改模板必须重建 transport，否则还在用旧出口")
 	}
 }
+
+// 探测失败时不能把已知出口抹成 "?"。
+//
+// 2026-11-03 线上实测：六个第三方 IP 回显站（ipify / ipinfo / icanhazip /
+// ifconfig.me / cloudflare trace / checkip.amazonaws）经这些出口**全部超时**
+// ——代理侧做了域名白名单，只有目标站可达。于是日志里 11 个账号全变成
+// 「出口=?」，恰好丢掉「是哪个出口出事」这个唯一有用的信息。
+//
+// 出口按账号恒定，所以旧值依然有效：探测失败只该更新探测时间，不该丢值。
+func TestEgressIPKeepsLastKnownOnProbeFailure(t *testing.T) {
+	var mu sync.Mutex
+	healthy := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ok := healthy
+		mu.Unlock()
+		if !ok {
+			// 模拟「探测站经代理不可达」：不返响应，让客户端超时
+			time.Sleep(300 * time.Millisecond)
+			return
+		}
+		fmt.Fprint(w, "203.0.113.99")
+	}))
+	defer srv.Close()
+	addr, _ := startSOCKS5(t)
+
+	c := New()
+	c.SetProxy(ProxyConfig{
+		Enabled:        true,
+		Template:       "socks5h://u-{account}:pw@" + addr,
+		Scope:          ProxyScopeAll,
+		EgressCheckURL: srv.URL,
+		// 极短 TTL：让第二次调用一定会去重新探测
+		EgressTTL: 10 * time.Millisecond,
+	})
+	uid := "9400"
+	if ip := c.EgressIP(context.Background(), uid); ip != "203.0.113.99" {
+		t.Fatalf("首次探测应拿到 IP，实得 %q", ip)
+	}
+
+	// 探测站开始不可达
+	mu.Lock()
+	healthy = false
+	mu.Unlock()
+	time.Sleep(30 * time.Millisecond) // 过了 TTL
+
+	ip := c.EgressIP(context.Background(), uid)
+	if ip != "203.0.113.99" {
+		t.Fatalf("探测失败时应沿用上次出口 203.0.113.99，实得 %q（抹成空会让日志失去排障价值）", ip)
+	}
+	if route := c.ProxyRoute(context.Background(), uid); !strings.Contains(route, "203.0.113.99") {
+		t.Fatalf("ProxyRoute 也应带上沿用的出口: %s", route)
+	}
+}

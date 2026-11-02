@@ -444,18 +444,14 @@ func (m *proxyManager) clientFor(uid string, headerTimeout, totalTimeout time.Du
 	return &http.Client{Timeout: totalTimeout, Transport: tr}, nil
 }
 
-// cachedEgress 取未过期的出口 IP（可能为空）。
+// cachedEgress 取已知的出口 IP（可能为空）。
+//
+// 不过期就返回：出口按账号恒定，一个过期的旧值仍然比 "?" 有用——
+// TTL 只用来决定「要不要重新探测」，不该用来把已经知道的地址丢掉。
 func (m *proxyManager) cachedEgress(uid string) string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	entry, ok := m.egress[uid]
-	if !ok {
-		return ""
-	}
-	if m.cfg.EgressTTL > 0 && time.Since(entry.at) > m.cfg.EgressTTL {
-		return ""
-	}
-	return entry.ip
+	return m.egress[uid].ip
 }
 
 // EgressIP 返回账号的出口 IP；没有缓存就同步查一次。
@@ -466,19 +462,20 @@ func (m *proxyManager) EgressIP(ctx context.Context, uid string) string {
 	if !m.usable() || uid == "" {
 		return ""
 	}
-	if ip := m.cachedEgress(uid); ip != "" {
-		return ip
-	}
-	// 同一账号并发只探测一次，其余等结果。
+	// 新鲜的直接用，不重复探测。注意这里判的是「新鲜」而不是「已知」：
+	// 已知但过期的值要触发一次刷新（出口恒定，刷新失败时再沿用旧值）。
 	m.mu.Lock()
-	if m.probing[uid] {
-		m.mu.RUnlock()
-		return m.cachedEgress(uid)
+	if entry, ok := m.egress[uid]; ok && entry.ip != "" {
+		if m.cfg.EgressTTL <= 0 || time.Since(entry.at) <= m.cfg.EgressTTL {
+			m.mu.Unlock()
+			return entry.ip
+		}
 	}
-	entry, hasCache := m.egress[uid]
-	if hasCache && m.cfg.EgressTTL > 0 && time.Since(entry.at) <= m.cfg.EgressTTL {
+	// 同一账号并发只探测一次，其余先拿已知值（可能为空）。
+	if m.probing[uid] {
+		known := m.egress[uid].ip
 		m.mu.Unlock()
-		return entry.ip
+		return known
 	}
 	m.probing[uid] = true
 	m.mu.Unlock()
@@ -486,11 +483,27 @@ func (m *proxyManager) EgressIP(ctx context.Context, uid string) string {
 	ip, err := m.probeEgress(ctx, uid)
 
 	m.mu.Lock()
+	if err != nil && ip == "" {
+		// 探测失败时保留上一次已知的出口，只更新探测时间。
+		//
+		// 这不是「掩盖错误」：出口按账号恒定（实测同一用户名重复探测结果不变），
+		// 所以上次测到的地址仍然是对的。抹成 "?" 反而更糟 —— 2026-11-03 线上
+		// 实测，六个第三方 IP 回显站经这些出口全部超时（代理做了域名白名单，
+		// 只有目标站可达），于是日志里 11 个账号全显示「出口=?」，
+		// 恰好丢掉了「是哪个出口出事」这个唯一有用的信息。
+		if prev, ok := m.egress[uid]; ok && prev.ip != "" {
+			ip = prev.ip
+		}
+	}
 	m.egress[uid] = egressEntry{ip: ip, at: time.Now(), err: err}
 	delete(m.probing, uid)
 	m.mu.Unlock()
 	if err != nil {
-		log.Printf("[proxy] 账号 %s 出口 IP 查询失败：%v", uid, err)
+		if ip != "" {
+			log.Printf("[proxy] 账号 %s 出口 IP 暂时查不到（沿用上次 %s）：%v", uid, ip, err)
+		} else {
+			log.Printf("[proxy] 账号 %s 出口 IP 查询失败：%v", uid, err)
+		}
 	}
 	return ip
 }
