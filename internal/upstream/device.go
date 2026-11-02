@@ -118,7 +118,11 @@ func (c *Client) BindDevice(ctx context.Context, a *auth.Auth) (string, error) {
 		// 2026-11-03 线上实测：11 个号上游全 bound，本地只记了 9 个。
 		if alreadyBound(string(resp.Body)) {
 			a.DeviceBound = "bound"
-			a.DeviceCheckedAt = time.Now().Format(time.RFC3339)
+			now := time.Now().Format(time.RFC3339)
+			a.DeviceCheckedAt = now
+			if a.DeviceBoundAt == "" {
+				a.DeviceBoundAt = now
+			}
 			return "", nil
 		}
 		return "", &Error{Kind: Classify(resp.Status, string(resp.Body)), Status: resp.Status,
@@ -146,6 +150,8 @@ func (c *Client) BindDevice(ctx context.Context, a *auth.Auth) (string, error) {
 	// 落盘：下次绑定/心跳要复用同一个 id，重启后也不能丢。
 	a.ClientDeviceID = deviceID
 	a.DeviceBound = "bound"
+	// 记下绑定时刻：签到用它区分「刚绑上还没发分」和「绑了很久也没发分」。
+	a.DeviceBoundAt = time.Now().Format(time.RFC3339)
 	return bound, nil
 }
 

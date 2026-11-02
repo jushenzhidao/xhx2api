@@ -855,6 +855,15 @@ func (p *Panel) accountsBindDeviceAll(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if a.DeviceBound == "bound" {
+			// 已 bound 但没记绑定时刻（老凭证）：顺手补上。
+			// 签到要靠它区分「刚绑上、等上游发分」和「绑了很久也没发分」，
+			// 缺了就只能在 pending 与 ineligible 之间瞎猜。
+			if a.DeviceBoundAt == "" {
+				a.DeviceBoundAt = time.Now().Format(time.RFC3339)
+				if serr := a.SaveAtomic(); serr != nil {
+					log.Printf("WARN: 账号 %s 补写绑定时刻失败: %v", uid, serr)
+				}
+			}
 			results = append(results, result{UID: uid, Skipped: true})
 			continue
 		}

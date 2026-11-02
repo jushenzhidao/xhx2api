@@ -22,6 +22,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -288,13 +289,59 @@ func (s *Scheduler) CheckinAccount(ctx context.Context, a *auth.Auth) CheckinOut
 			out.Message = "账号未绑定可信设备，上游不会发放每日积分；需在官方客户端登录一次完成设备绑定"
 			return out
 		}
+		// 刚绑上设备的号要给它一个宽限期。
+		//
+		// 这条 ineligible 是在「绑定只能靠用户去官方客户端、代码侧补不了」的
+		// 前提下写的：那时 bound=true 却从没发过分，基本就是上游真不给。
+		// 自从补绑接口打通（/devices_current_bind），情况变了 —— 我们刚把号
+		// 绑上，流水里当然一条 daily_grant 都没有。此时判 ineligible 等于
+		// 「绑好了也永远不再检查」，白白把这批号废掉。
+		// 绑定时刻未知（老凭证没有 device_bound_at）。
+		//
+		// 我们自己的补绑一定会写这个字段，所以「未知」= 绑定发生在系统之外
+		// （用户在官方客户端绑的，或早于该字段引入）。这种情况沿用原判断：
+		// 老号 + 从未发分 = 上游确实不给，判 ineligible。
+		// 但必须留一条出路——万一用户刚在客户端绑过，点一次「补绑设备」
+		// 就能把时刻补上，之后就进入宽限期正常参与签到。
+		since, sinceKnown := boundRecently(a.DeviceBoundAt, time.Now())
+		if sinceKnown && since < deviceBindGrace {
+			out.Status = "pending"
+			out.Message = fmt.Sprintf("刚补绑可信设备 %s，等上游首次发放（每日积分发放时点不固定）",
+				since.Round(time.Minute))
+			return out
+		}
 		out.Status = "ineligible"
-		out.Message = "该账号已绑设备但历史上从未获得每日积分，无需签到"
+		if sinceKnown {
+			out.Message = "该账号已绑设备但历史上从未获得每日积分，无需签到"
+		} else {
+			out.Message = "该账号已绑设备但历史无发放记录（绑定时刻未知）；若刚在客户端绑过，" +
+				"点「补绑设备」同步状态后即可参与签到"
+		}
 		return out
 	}
 	out.Status = "pending"
 	out.Message = "上游今日尚未发放，稍后再试"
 	return out
+}
+
+// deviceBindGrace 是「刚绑上设备」的宽限期。
+//
+// 每日 +300 的发放时点不固定（实测出现 00:00 / 00:21 / 09:25 / 13:30 等），
+// 所以绑完当天没看到流水是正常的，不能马上判死。3 天足够覆盖周末式的延迟，
+// 又不至于让真无资格的号一直占用签到请求。
+const deviceBindGrace = 72 * time.Hour
+
+// boundRecently 报告设备绑定距今多久。未记录绑定时刻时 ok=false：
+// 那是「不知道」，不该被当成「很久以前」而立刻判 ineligible。
+func boundRecently(boundAt string, now time.Time) (time.Duration, bool) {
+	if strings.TrimSpace(boundAt) == "" {
+		return 0, false
+	}
+	at, err := time.Parse(time.RFC3339, boundAt)
+	if err != nil {
+		return 0, false
+	}
+	return now.Sub(at), true
 }
 
 // deviceProfile 是账号上游资料的本地视图（含「这份资料新不新」）。

@@ -89,6 +89,11 @@ type Data struct {
 	// 等于同一账号不断声明新设备，正是风控最敏感的模式。首次绑定时生成，
 	// 之后所有绑定/心跳都用同一个值。
 	ClientDeviceID string `json:"client_device_id,omitempty"`
+	// DeviceBoundAt 是「设备被绑上」的时刻（RFC3339），只在绑定成功时写。
+	//
+	// 与 DeviceCheckedAt 分开记，因为后者每次查 user_info 都会刷新，
+	// 而判断「是不是刚绑的、上游可能还没来得及发分」需要的是绑定时刻。
+	DeviceBoundAt string `json:"device_bound_at,omitempty"`
 	// DeviceCheckedAt 是上一次查 DeviceBound 的时刻（RFC3339），用于 TTL 复用，
 	// 免得每轮签到都对每个号打一次 user_info。
 	DeviceCheckedAt string `json:"device_checked_at,omitempty"`
@@ -430,6 +435,7 @@ func buildAuth(payload map[string]any) (*Auth, error) {
 		// client_device_id 也必须还原：换了它等于换了台机器，
 		// 上游会把「同一账号不断声明新设备」当成异常。
 		ClientDeviceID: text(payload, "client_device_id"),
+		DeviceBoundAt:  text(payload, "device_bound_at"),
 	}}
 	if a.ExpiresAt == 0 {
 		a.ExpiresAt = JWTExpiry(access)
