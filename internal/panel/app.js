@@ -31,7 +31,14 @@
     configView: "form",
     qr: { id: null, timer: null },
     device: { id: null, timer: null },
+    // 账号表的筛选/排序/分页。全是内存态：数据源仍是 overview 快照，
+    // 切筛选不发请求，也不改 10 秒轮询节奏。
+    accView: { q: "", status: "all", sort: "default", size: 50, page: 1 },
   };
+
+  // 账号表的 keyed 行缓存：uid → { el, sig }。轮询时按签名做增量更新，
+  // 避免整表 innerHTML 重建（会丢滚动位置、hover tooltip、选中文本）。
+  const accRows = new Map();
 
   // $ 是 querySelector 的薄封装（选择器必须带 # / . / [）。
   // 裸 id 会被当成标签名、静默返回 null——这类手误只会表现成「页面某块空白」，
@@ -45,6 +52,56 @@
     return el;
   };
   const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+
+  // ---------------------------------------------------------------------
+  // 主题：跟随系统 → 浅色 → 深色（点一次循环一档）
+
+  const THEME_KEY = "xhx_theme";
+  const THEME_ORDER = ["auto", "light", "dark"];
+  const THEME_LABEL = { auto: "跟随系统", light: "浅色", dark: "深色" };
+
+  function themePref() {
+    const saved = localStorage.getItem(THEME_KEY);
+    return THEME_ORDER.indexOf(saved) >= 0 ? saved : "auto";
+  }
+
+  function effTheme() {
+    const t = themePref();
+    if (t !== "auto") return t;
+    return matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  }
+
+  // 只切 <html data-theme>，颜色全交给 CSS 令牌。
+  // 图标同步换：浅色显示太阳（代表当前外观），深色显示月亮。
+  function applyTheme() {
+    const eff = effTheme();
+    document.documentElement.dataset.theme = eff;
+    const ico = $("#icoTheme");
+    if (ico) {
+      ico.innerHTML = eff === "light"
+        ? '<circle cx="8" cy="8" r="3"/><path d="M8 1.2v1.9M8 12.9v1.9M1.2 8h1.9M12.9 8h1.9M3.2 3.2l1.4 1.4M11.4 11.4l1.4 1.4M12.8 3.2l-1.4 1.4M4.6 11.4l-1.4 1.4"/>'
+        : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
+    }
+    const btn = $("#btnTheme");
+    if (btn) btn.title = "主题：" + THEME_LABEL[themePref()] + "（点击切换）";
+  }
+
+  // ---------------------------------------------------------------------
+  // 手机端抽屉（桌面端由 CSS 保证 .nav 常驻、.nav-btn 不显示）
+
+  function setNav(open) {
+    const drawer = $("#navDrawer");
+    if (!drawer) return;
+    drawer.classList.toggle("open", open);
+    const veil = $("#navVeil");
+    if (veil) veil.classList.toggle("on", open);
+    const btn = $("#navBtn");
+    if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+  }
+
+  // 立刻应用一次：脚本在 </body> 前执行，此时 DOM 已就绪，
+  // 不会出现「先白一下再变深色」的闪烁。
+  applyTheme();
 
   // ---------------------------------------------------------------------
   // 基础工具
@@ -89,36 +146,65 @@
   }
 
   function toast(msg, kind) {
-    // 极简 toast：顶部中间浮一条，2.4 秒后消失。
+    // 极简 toast：顶部中间浮一条，2.6 秒后消失。
+    // 样式全在 style.css（#toast.ok/.warn/.bad）：以前写内联，深色主题下是白字压色块。
     let el = $("#toast");
     if (!el) {
       el = document.createElement("div");
       el.id = "toast";
-      el.style.cssText =
-        "position:fixed;top:14px;left:50%;transform:translateX(-50%);z-index:99;" +
-        "padding:9px 16px;border-radius:9px;font-size:12.5px;color:#fff;" +
-        "box-shadow:0 8px 26px rgba(16,24,40,.2);transition:opacity .2s;max-width:80vw";
       document.body.appendChild(el);
     }
-    el.style.background = kind === "bad" ? "#c0392b" : kind === "warn" ? "#b06d00" : "#12805c";
+    el.className = kind === "bad" ? "bad" : kind === "warn" ? "warn" : "ok";
     el.textContent = msg;
     el.style.opacity = "1";
     clearTimeout(el._t);
-    el._t = setTimeout(() => { el.style.opacity = "0"; }, 2400);
+    el._t = setTimeout(() => { el.style.opacity = "0"; }, 2600);
   }
 
   // ---------------------------------------------------------------------
   // API
 
+  // GET 的两条防护，都是为「10 秒轮询 + 公网抖动」这个组合：
+  //   1) 超时。裸 fetch 在链路半死时会挂几分钟，既不报错也不返回，界面永远停在
+  //      旧值上，也没有任何提示。超时必须按方法分档：POST 里有批量签到/保活，
+  //      实测要一两分钟，给 8 秒会把「还在正常跑」误报成超时（服务端还在真扣积分）。
+  //   2) 同路径防重入。上一轮没回来就跳过本轮（**不排队**）：排队只会让数据更旧，
+  //      而乱序返回会让旧响应盖掉新响应。
+  // 两条都只对 GET 生效：POST 是用户动作，跳过等于「点了没反应」。
+  const GET_TIMEOUT_MS = 8000;
+  const POST_TIMEOUT_MS = 300000;
+  const apiInflight = new Set();
+
   async function api(path, opts) {
     opts = opts || {};
+    const method = String(opts.method || "GET").toUpperCase();
+    const isGet = method === "GET";
+    if (isGet && apiInflight.has(path)) return null; // 上一轮还没回来：本轮直接跳过
+    if (isGet) apiInflight.add(path);
+
     const headers = Object.assign({}, opts.headers || {});
     if (state.key) headers["Authorization"] = "Bearer " + state.key;
     if (opts.body && typeof opts.body !== "string") {
       headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(opts.body);
     }
-    const res = await fetch(path, Object.assign({}, opts, { headers }));
+
+    const timeout = isGet ? GET_TIMEOUT_MS : POST_TIMEOUT_MS;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeout);
+    let res;
+    try {
+      res = await fetch(path, Object.assign({}, opts, { headers, signal: ctl.signal }));
+    } catch (e) {
+      if (e && e.name === "AbortError") {
+        throw new Error("请求超时（" + Math.round(timeout / 1000) + " 秒）：" + path);
+      }
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      if (isGet) apiInflight.delete(path);
+    }
+
     if (res.status === 401) {
       showLogin("密钥无效，请重新输入");
       throw new Error("unauthorized");
@@ -181,37 +267,49 @@
   // ---------------------------------------------------------------------
   // 数据加载
 
+  // 每个 loadXxx 都先判 null：api() 在「同路径上一轮还没回来」时会直接返回 null
+  // 表示本轮跳过。不判的话要么把 null 赋进 state（后续 render 崩），要么白刷一遍。
   async function loadOverview() {
-    state.overview = await api("/panel/api/overview");
+    const data = await api("/panel/api/overview");
+    if (!data) return;
+    state.overview = data;
     renderCards();
     renderAccounts();
     renderScheduler();
-    $("#ver").textContent = state.overview.version || "dev";
+    $("#ver").textContent = data.version || "dev";
   }
 
   async function loadModels() {
-    state.models = await api("/panel/api/models");
+    const data = await api("/panel/api/models");
+    if (!data) return;
+    state.models = data;
     renderModels();
   }
 
   async function loadRequests() {
-    state.requests = await api("/panel/api/requests?limit=100");
+    const data = await api("/panel/api/requests?limit=100");
+    if (!data) return;
+    state.requests = data;
     renderRequests();
   }
 
   async function loadUsage() {
-    state.usage = await api("/panel/api/usage");
+    const data = await api("/panel/api/usage");
+    if (!data) return;
+    state.usage = data;
     renderUsage();
   }
 
   async function loadLogs() {
     const data = await api("/panel/api/logs?limit=300");
-    state.logs = (data && data.lines) || [];
+    if (!data) return;
+    state.logs = data.lines || [];
     renderLogs();
   }
 
   async function loadConfig() {
     const data = await api("/panel/api/config");
+    if (!data) return;
     state.config = data;
     $("#config-path").textContent = data.path || "";
     $("#config-editor").value = JSON.stringify(data.config, null, 2);
@@ -248,21 +346,74 @@
     return { plan_limit: "额度", soft_rate: "限流", session_dead: "登录态", gateway: "网关", busy: "排队", not_found: "404" }[kind] || "冷却";
   }
 
+  // 状态归类：筛选、异常条、排序分组三处必须用同一个口径，
+  // 否则会出现「条上数了 3 个冷却、点进去只有 2 行」这种自相矛盾。
+  // 优先级与 accountState() 一致：禁用 > 暂停 > 熔断/冷却 > 可用。
+  function accStatus(a) {
+    const now = Date.now() / 1000;
+    if (a.disabled) return "off";
+    if (a.paused) return "paused";
+    if (a.breaker_until > now || a.cooldown_until > now) return "cool";
+    return "ok";
+  }
+
+  function accMatch(a, v) {
+    if (v.status !== "all") {
+      if (v.status === "issue") {
+        if (accStatus(a) === "ok") return false;
+      } else if (accStatus(a) !== v.status) {
+        return false;
+      }
+    }
+    if (!v.q) return true;
+    const q = v.q.toLowerCase();
+    return String(a.nickname || "").toLowerCase().includes(q) ||
+      String(a.uid || "").toLowerCase().includes(q);
+  }
+
+  // 排序分组：异常优先。0 禁用 / 1 冷却 / 2 暂停 / 3 正常，组内按导入顺序（列表原序）。
+  function accRank(a) {
+    const s = accStatus(a);
+    return s === "off" ? 0 : s === "cool" ? 1 : s === "paused" ? 2 : 3;
+  }
+
+  function accSortList(list, sort) {
+    const arr = list.slice();
+    if (sort === "default" || !sort) {
+      // 稳定排序靠「只比 rank」+ slice 保持原序（现代 V8 的 sort 本身稳定，
+      // 但显式依赖它比依赖实现细节更安全）。
+      return arr.sort((a, b) => accRank(a) - accRank(b));
+    }
+    const byNum = (f) => (a, b) => (f(b) || 0) - (f(a) || 0);
+    if (sort === "credits_desc") return arr.sort(byNum((x) => x.credits));
+    if (sort === "credits_asc") return arr.sort((a, b) => (a.credits || 0) - (b.credits || 0));
+    if (sort === "fails_desc") return arr.sort(byNum((x) => (x.total || 0) - (x.success || 0)));
+    if (sort === "success_desc") return arr.sort(byNum((x) => x.success));
+    if (sort === "last_used") return arr.sort(byNum((x) => x.last_used));
+    if (sort === "name") {
+      return arr.sort((a, b) => String(a.nickname || a.uid).localeCompare(String(b.nickname || b.uid), "zh-CN"));
+    }
+    return arr;
+  }
+
   function renderCards() {
     const o = state.overview;
     if (!o) return;
     const c = o.counts || {};
-    // 顶栏健康灯：有账号且有可用号 = 运行中；有号但全冷却 = 降级；没号 = 待配置。
-    const health = $("#health");
-    if (!c.total) {
-      health.textContent = "待配置";
-      health.className = "pill warn";
-    } else if (!c.healthy) {
-      health.textContent = "全部冷却";
-      health.className = "pill bad";
-    } else {
-      health.textContent = "运行中";
-      health.className = "pill ok";
+    // 侧栏状态灯：有账号且有可用号 = 运行中；有号但全冷却 = 降级；没号 = 待配置。
+    const pulse = $("#navPulse");
+    const navState = $("#navState");
+    if (pulse && navState) {
+      if (!c.total) {
+        pulse.className = "pulse warn";
+        navState.textContent = "待配置";
+      } else if (!c.healthy) {
+        pulse.className = "pulse bad";
+        navState.textContent = "全部冷却";
+      } else {
+        pulse.className = "pulse";
+        navState.textContent = "运行中";
+      }
     }
     const r = o.requests || {};
     const successRate = r.total ? ((r.success / r.total) * 100).toFixed(1) + "%" : "-";
@@ -280,56 +431,258 @@
         <div class="value">${esc(card.value)}</div>
         <div class="foot">${esc(card.foot || "")}</div>
       </div>`).join("");
+    // 顶栏副标题跟着账号概览走：一眼看到「几个能用、几个在途」。
+    const meta = $("#subMeta");
+    if (meta) {
+      meta.textContent = c.total
+        ? `可用 ${c.healthy || 0}/${c.total} · 在途 ${c.in_flight || 0} · 成功率 ${successRate}`
+        : "账号池为空";
+    }
+  }
+
+  // ── 账号表：行签名 + 增量更新 ─────────────────────────────────────────
+  // 原来每 10 秒一次 innerHTML 重建整表。号一多后果很具体：滚动位置回弹、
+  // hover 的 title 消失、正在看的行跳到别处、选中文本被清空。
+  // 现在：首次全量建表；之后签名相同就一个字节都不写，不同才重建那一行；
+  // 新 uid 建行、消失的删行、顺序变化用 insertBefore 移动（保留节点身份）。
+  // 行内按钮走 tbody 的事件委托 + data-uid，所以重建单行不会丢事件绑定。
+  function accRowSig(a, maxCred) {
+    const st = accountState(a);
+    // fmtAgo 的文本随时间变。把「距今多少分钟」做成桶放进签名：
+    // 完全不进签名 → 「3 分钟前」会冻住；按秒进签名 → 每轮都全表重建。
+    const agoBucket = a.last_used ? Math.floor((Date.now() / 1000 - a.last_used) / 60) : -1;
+    return [
+      a.uid, a.nickname, a.credits, maxCred, a.checked_in === todayStr() ? 1 : 0,
+      st.text, st.cls, st.tip || "", a.cooldown_note || "", a.last_error || "",
+      a.in_flight || 0, a.total || 0, a.success || 0, a.avg_latency_ms || 0,
+      agoBucket, a.has_refresh ? 1 : 0, a.disabled ? 1 : 0, a.paused ? 1 : 0,
+    ].join("\u0001");
+  }
+
+  function accRowHtml(a, maxCred) {
+    const now = Date.now() / 1000;
+    const st = accountState(a);
+    const total = a.total || 0;
+    const rate = total ? ((a.success / total) * 100).toFixed(0) + "%" : "-";
+    const signed = a.checked_in === todayStr();
+    const checkin = signed ? `<span class="tag ok">已签</span>` : `<span class="tag">未签</span>`;
+    // 积分条：剩余 / 池内最高。表达的是「这个号还剩多少额度」的绝对量，
+    // 基准取全池最大值、不跟筛选走——否则同一个号切筛选前后百分比会变，
+    // 「筛到只剩低分号时显示满格」会被误读成额度健康。
+    const pct = Math.min(100, Math.round(((a.credits || 0) / maxCred) * 100));
+    const pctCls = pct < 15 ? "bad" : pct < 40 ? "warn" : "";
+    const actions = [];
+    actions.push(`<button class="btn mini" data-act="checkin" data-uid="${esc(a.uid)}">签到</button>`);
+    actions.push(`<button class="btn mini" data-act="balance" data-uid="${esc(a.uid)}">余额</button>`);
+    if (a.disabled) {
+      actions.push(`<button class="btn mini" data-act="enable" data-uid="${esc(a.uid)}">启用</button>`);
+    } else if (a.paused) {
+      actions.push(`<button class="btn mini" data-act="resume" data-uid="${esc(a.uid)}">恢复</button>`);
+    } else {
+      if (a.cooldown_until > now || a.breaker_until > now) {
+        actions.push(`<button class="btn mini" data-act="revive" data-uid="${esc(a.uid)}">解冻</button>`);
+      }
+      actions.push(`<button class="btn mini" data-act="pause" data-uid="${esc(a.uid)}">暂停</button>`);
+      actions.push(`<button class="btn mini" data-act="disable" data-uid="${esc(a.uid)}">禁用</button>`);
+    }
+    actions.push(`<button class="btn mini danger" data-act="remove" data-uid="${esc(a.uid)}">移除</button>`);
+    // data-label 是手机端「卡片化」用的：≤760px 时表头隐藏、每个 td 前面
+    // 用 ::before 打出字段名，否则一屏数字看不出哪列是哪列。
+    return `<tr data-uid="${esc(a.uid)}">
+      <td class="who" data-label="账号">
+        <div class="acct-name">${esc(a.nickname || a.uid)}</div>
+        <div class="uid">${esc(a.uid)}${a.has_refresh ? "" : " · 无续期令牌"}</div>
+      </td>
+      <td class="cred-cell" data-label="积分" title="剩余 ${esc(fmtNum(a.credits))}（池内最高 ${esc(fmtNum(maxCred))}）">
+        <div class="n">${fmtNum(a.credits)}</div>
+        <div class="bar"><i class="${pctCls}" style="width:${pct}%"></i></div>
+      </td>
+      <td data-label="签到">${checkin}</td>
+      <td data-label="状态" title="${esc(st.tip || "")}"><span class="tag ${st.cls}">${esc(st.text)}</span>
+        ${a.cooldown_note && (a.cooldown_until > now) ? `<div class="uid">${esc(a.cooldown_note)}</div>` : ""}
+        ${a.last_error && !(a.cooldown_until > now) ? `<div class="uid" title="${esc(a.last_error)}">${esc(a.last_error.slice(0, 40))}</div>` : ""}
+      </td>
+      <td class="num" data-label="在途">${a.in_flight || 0}</td>
+      <td class="num" data-label="请求">${fmtNum(total)}<span class="muted"> · ${fmtAgo(a.last_used)}</span></td>
+      <td class="num" data-label="成功率">${rate}</td>
+      <td class="num" data-label="延迟">${fmtDur(a.avg_latency_ms)}</td>
+      <td class="acts" data-label="操作"><div class="rowacts">${actions.join("")}</div></td>
+    </tr>`;
+  }
+
+  // <template> 解析成节点：不执行脚本、不加载资源，
+  // 也不像往活 DOM 里插字符串那样触发整表重排。
+  function trFromHtml(html) {
+    const tpl = document.createElement("template");
+    tpl.innerHTML = html;
+    return tpl.content.firstElementChild;
+  }
+
+  const ACC_STATUS = [
+    { k: "all", label: "全部" },
+    { k: "issue", label: "异常" },
+    { k: "ok", label: "可用" },
+    { k: "cool", label: "冷却" },
+    { k: "paused", label: "暂停" },
+    { k: "off", label: "禁用" },
+  ];
+
+  function renderAccChips(all) {
+    const box = $("#accStatusChips");
+    if (!box) return;
+    const n = { all: all.length, issue: 0, ok: 0, cool: 0, paused: 0, off: 0 };
+    all.forEach((a) => {
+      const s = accStatus(a);
+      n[s]++;
+      if (s !== "ok") n.issue++;
+    });
+    const v = state.accView;
+    // 签名没变就不写 DOM：10 秒轮询里绝大多数轮次计数都不变，
+    // 白写一次 innerHTML 等于让整条工具栏重排一次。
+    const sig = ACC_STATUS.map((s) => s.k + n[s.k]).join("|") + v.status;
+    if (box.dataset.sig === sig) return;
+    box.dataset.sig = sig;
+    box.innerHTML = ACC_STATUS.map((s) => {
+      const tone = s.k === "issue" && n.issue ? " bad" : (s.k === "cool" && n.cool) ? " warn" : "";
+      return `<button class="chip${v.status === s.k ? " on" : ""}${tone}" data-status="${s.k}" type="button">` +
+        `${s.label}<span class="n">${n[s.k]}</span></button>`;
+    }).join("");
+  }
+
+  // 异常汇总条：全池健康时整条 hidden，0 高 0 边距，不占位。
+  // 留一条常驻空条既浪费高度，又会被读成「装饰」——异常真出现时反而不显眼。
+  function renderAlertBar(all) {
+    const bar = $("#alertBar");
+    if (!bar) return;
+    const n = { off: 0, cool: 0, paused: 0 };
+    all.forEach((a) => {
+      const s = accStatus(a);
+      if (n[s] !== undefined) n[s]++;
+    });
+    const parts = [];
+    if (n.off) parts.push(n.off + " 个已禁用");
+    if (n.cool) parts.push(n.cool + " 个冷却 / 熔断");
+    if (n.paused) parts.push(n.paused + " 个已暂停");
+    if (!parts.length) {
+      bar.hidden = true;
+      return;
+    }
+    bar.hidden = false;
+    const txt = $("#alertText");
+    if (txt) txt.textContent = "需要关注：" + parts.join(" · ");
+    const dot = $("#alertDot");
+    if (dot) dot.className = "pulse " + (n.off || n.cool ? "bad" : "warn");
+    const chips = $("#alertChips");
+    if (chips) {
+      chips.innerHTML = [
+        n.off ? `<button class="chip on bad" data-status="off" type="button">查看禁用 ${n.off}</button>` : "",
+        n.cool ? `<button class="chip on warn" data-status="cool" type="button">查看冷却 ${n.cool}</button>` : "",
+        n.paused ? `<button class="chip on warn" data-status="paused" type="button">查看暂停 ${n.paused}</button>` : "",
+      ].join("");
+    }
+  }
+
+  function renderAccPager(total, pages, start, shown) {
+    const info = $("#accPageInfo");
+    const num = $("#accPageNum");
+    const prev = $("#accPrev");
+    const next = $("#accNext");
+    if (info) {
+      info.textContent = total ? `第 ${start + 1}–${start + shown} 条 · 共 ${total} 条` : "共 0 条";
+    }
+    if (num) num.textContent = pages > 1 ? `${state.accView.page} / ${pages}` : "";
+    if (prev) prev.disabled = state.accView.page <= 1;
+    if (next) next.disabled = state.accView.page >= pages;
   }
 
   function renderAccounts() {
-    const list = (state.overview && state.overview.accounts) || [];
     const tbody = $("#accounts-table tbody");
+    if (!tbody) return;
+    const list = (state.overview && state.overview.accounts) || [];
+    const v = state.accView;
+
     if (!list.length) {
-      tbody.innerHTML = `<tr><td colspan="9" class="muted" style="padding:26px;text-align:center">
-        还没有账号。点右上角「添加账号」导入凭证，或用微信扫码登录。</td></tr>`;
+      accRows.clear();
+      tbody.innerHTML = `<tr><td colspan="9"><div class="empty">
+        <div class="big">账号池是空的</div>
+        点右上角「添加账号」导入凭证，或用「客户端目录」「手机号」登录。</div></td></tr>`;
+      renderAccChips(list);
+      renderAlertBar(list);
+      renderAccPager(0, 1, 0, 0);
       return;
     }
-    const now = Date.now() / 1000;
-    tbody.innerHTML = list.map((a) => {
-      const st = accountState(a);
-      const total = a.total || 0;
-      const rate = total ? ((a.success / total) * 100).toFixed(0) + "%" : "-";
-      const checkin = a.checked_in === todayStr() ? `<span class="tag ok">已签</span>` : `<span class="tag">未签</span>`;
-      const creditCls = a.credits === 0 ? "bad" : a.credits < 500 ? "warn" : "";
-      const actions = [];
-      actions.push(`<button class="btn mini" data-act="checkin" data-uid="${esc(a.uid)}">签到</button>`);
-      actions.push(`<button class="btn mini" data-act="balance" data-uid="${esc(a.uid)}">余额</button>`);
-      if (a.disabled) {
-        actions.push(`<button class="btn mini" data-act="enable" data-uid="${esc(a.uid)}">启用</button>`);
-      } else if (a.paused) {
-        actions.push(`<button class="btn mini" data-act="resume" data-uid="${esc(a.uid)}">恢复</button>`);
-      } else {
-        if (a.cooldown_until > now || a.breaker_until > now) {
-          actions.push(`<button class="btn mini" data-act="revive" data-uid="${esc(a.uid)}">解冻</button>`);
-        }
-        actions.push(`<button class="btn mini" data-act="pause" data-uid="${esc(a.uid)}">暂停</button>`);
-        actions.push(`<button class="btn mini" data-act="disable" data-uid="${esc(a.uid)}">禁用</button>`);
+
+    const maxCred = Math.max(1, ...list.map((a) => a.credits || 0));
+    // ① 过滤 → ② 排序 → ③ 分页，全在内存里完成。
+    // 顺序不能换：先分页再排序会让「第 2 页」的含义随排序变，翻页时内容乱跳。
+    const filtered = list.filter((a) => accMatch(a, v));
+    const sorted = accSortList(filtered, v.sort);
+    const total = sorted.length;
+    const size = v.size > 0 ? v.size : Math.max(1, total);
+    const pages = Math.max(1, Math.ceil(total / size));
+    // 页码夹紧：筛选后总数变少时，停在原来第 5 页会看到空表（最容易被当成 bug）。
+    if (v.page > pages) v.page = pages;
+    if (v.page < 1) v.page = 1;
+    const start = (v.page - 1) * size;
+    const rows = sorted.slice(start, start + size);
+
+    renderAccChips(list);
+    renderAlertBar(list);
+    renderAccPager(total, pages, start, rows.length);
+
+    if (!rows.length) {
+      accRows.clear();
+      // 两种空态要分开：「池子空」和「筛选没命中」的下一步动作完全不同。
+      tbody.innerHTML = `<tr><td colspan="9"><div class="empty">
+        <div class="big">没有匹配的账号</div>
+        当前筛选下 ${list.length} 个号里没有命中的。
+        <button class="btn mini" id="accClearFilter" type="button">清除筛选</button></div></td></tr>`;
+      return;
+    }
+
+    const items = rows.map((a) => ({
+      key: a.uid,
+      sig: accRowSig(a, maxCred),
+      html: () => accRowHtml(a, maxCred), // 惰性求值：签名没变的行连字符串都不拼
+    }));
+
+    // 首次（或刚从空态回来）：一次 innerHTML 建全表，比逐行 append 快得多。
+    if (!accRows.size) {
+      tbody.innerHTML = items.map((it) => it.html()).join("");
+      items.forEach((it, i) => accRows.set(it.key, { el: tbody.children[i], sig: it.sig }));
+      return;
+    }
+
+    // ① 删掉本轮不该存在的行
+    const seen = new Set(items.map((it) => it.key));
+    for (const [key, row] of accRows) {
+      if (seen.has(key)) continue;
+      row.el.remove();
+      accRows.delete(key);
+    }
+    // ② 一个游标走完新顺序：对得上就不动，对不上就 insertBefore 拽过来。
+    //    处理过的行总在游标之前，所以游标之后剩下的必然是这轮不该存在的节点。
+    let cursor = tbody.firstElementChild;
+    for (const it of items) {
+      let row = accRows.get(it.key);
+      const atCursor = !!row && row.el === cursor;
+      if (!row) {
+        row = { el: trFromHtml(it.html()), sig: it.sig };
+        accRows.set(it.key, row);
+      } else if (row.sig !== it.sig) {
+        const fresh = trFromHtml(it.html());
+        row.el.replaceWith(fresh);
+        row.el = fresh;
+        row.sig = it.sig;
       }
-      actions.push(`<button class="btn mini danger" data-act="remove" data-uid="${esc(a.uid)}">移除</button>`);
-      return `<tr>
-        <td>
-          <div class="acct-name">${esc(a.nickname || a.uid)}</div>
-          <div class="uid">${esc(a.uid)}${a.has_refresh ? "" : " · 无续期令牌"}</div>
-        </td>
-        <td class="num"><span class="tag ${creditCls}">${fmtNum(a.credits)}</span></td>
-        <td>${checkin}</td>
-        <td title="${esc(st.tip || "")}"><span class="tag ${st.cls}">${esc(st.text)}</span>
-          ${a.cooldown_note && (a.cooldown_until > now) ? `<div class="uid">${esc(a.cooldown_note)}</div>` : ""}
-          ${a.last_error && !(a.cooldown_until > now) ? `<div class="uid" title="${esc(a.last_error)}">${esc(a.last_error.slice(0, 40))}</div>` : ""}
-        </td>
-        <td class="num">${a.in_flight || 0}</td>
-        <td class="num">${fmtNum(total)}<span class="muted"> · ${fmtAgo(a.last_used)}</span></td>
-        <td class="num">${rate}</td>
-        <td class="num">${fmtDur(a.avg_latency_ms)}</td>
-        <td><div class="rowacts">${actions.join("")}</div></td>
-      </tr>`;
-    }).join("");
+      if (atCursor) cursor = row.el.nextElementSibling;
+      else tbody.insertBefore(row.el, cursor);
+    }
+    while (cursor) {
+      const next = cursor.nextElementSibling;
+      cursor.remove();
+      cursor = next;
+    }
   }
 
   function todayStr() {
@@ -935,6 +1288,17 @@
   // ---------------------------------------------------------------------
   // 事件：标签页
 
+  // 顶栏标题与副标题：切页时换掉，side nav 只给一个词，顶栏说清「现在在哪」。
+  const TAB_TITLES = {
+    accounts: ["账号池", "账号健康度、积分与调度"],
+    models: ["模型", "上游目录、别名与单价"],
+    requests: ["请求", "最近 100 条请求与耗时"],
+    points: ["积分", "发放制额度：每日 300 与三笔一次性奖励"],
+    usage: ["用量", "按账号 / 按日累计"],
+    logs: ["运行日志", "进程实时输出"],
+    config: ["配置", "热改字段与 JSON 全量编辑"],
+  };
+
   // activateTab 切换标签并加载该页数据。#models 这类 hash 可直接定位（方便
   // 分享「去看配置」这种链接，也让无头截图能逐页验证）。
   async function activateTab(tab, updateHash) {
@@ -943,9 +1307,16 @@
     state.tab = tab;
     $$(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
     $$(".pane").forEach((p) => p.classList.toggle("active", p.id === "pane-" + tab));
+    const meta = TAB_TITLES[tab] || ["控制台", ""];
+    const ttl = $("#ttl");
+    if (ttl) ttl.textContent = meta[0];
+    const sub = $("#subMeta");
+    // 账号页的副标题由 renderCards 写实时数据；其他页写静态说明。
+    if (sub && tab !== "accounts") sub.textContent = meta[1];
     if (updateHash && location.hash.slice(1) !== tab) {
       history.replaceState(null, "", "#" + tab);
     }
+    setNav(false); // 手机端：点完导航就收起抽屉
     try {
       if (tab === "models") await loadModels();
       if (tab === "requests") await loadRequests();
@@ -962,12 +1333,99 @@
 
   $("#tabs").addEventListener("click", (e) => {
     const btn = e.target.closest(".tab");
-    if (btn) activateTab(btn.dataset.tab, true);
+    if (!btn) return;
+    e.preventDefault();
+    activateTab(btn.dataset.tab, true);
   });
 
   window.addEventListener("hashchange", () => {
     const tab = location.hash.slice(1);
     if (tab && tab !== state.tab) activateTab(tab, false);
+  });
+
+  // ---------------------------------------------------------------------
+  // 事件：账号表工具栏（搜索 / 筛选 / 排序 / 分页）
+  //
+  // 全部只改 state.accView 再重绘，不发请求。改任何一项都把页码重置到 1：
+  // 否则在「第 3 页」改筛选会落到一个可能已经不存在的位置。
+
+  function setAccFilter(patch) {
+    Object.assign(state.accView, patch);
+    if (!("page" in patch)) state.accView.page = 1;
+    renderAccounts();
+  }
+
+  let accQTimer = null;
+  $("#accQ").addEventListener("input", (e) => {
+    const val = e.target.value;
+    const box = $("#accSearch");
+    if (box) box.classList.toggle("has-q", !!val);
+    // 90ms 防抖：账号列表只有几十行，但每敲一个字符重绘一次没必要。
+    clearTimeout(accQTimer);
+    accQTimer = setTimeout(() => setAccFilter({ q: val.trim() }), 90);
+  });
+
+  $("#accQClear").addEventListener("click", () => {
+    const q = $("#accQ");
+    q.value = "";
+    q.dispatchEvent(new Event("input"));
+    q.focus();
+  });
+
+  function onStatusChip(e) {
+    const chip = e.target.closest("[data-status]");
+    if (!chip) return;
+    setAccFilter({ status: chip.dataset.status });
+  }
+  $("#accStatusChips").addEventListener("click", onStatusChip);
+  // 异常汇总条里的「查看禁用 N」也是同一套 data-status，直接复用。
+  $("#alertChips").addEventListener("click", onStatusChip);
+
+  $("#accSort").addEventListener("change", (e) => setAccFilter({ sort: e.target.value }));
+  $("#accSize").addEventListener("change", (e) => setAccFilter({ size: Number(e.target.value) || 0 }));
+  $("#accPrev").addEventListener("click", () => {
+    if (state.accView.page > 1) { state.accView.page--; renderAccounts(); }
+  });
+  $("#accNext").addEventListener("click", () => {
+    state.accView.page++;
+    renderAccounts();
+  });
+
+  // 「清除筛选」按钮长在空态文案里（动态生成），只能走文档级委托。
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest("#accClearFilter")) return;
+    const q = $("#accQ");
+    if (q) q.value = "";
+    const box = $("#accSearch");
+    if (box) box.classList.remove("has-q");
+    setAccFilter({ q: "", status: "all" });
+  });
+
+  // ---------------------------------------------------------------------
+  // 事件：主题 / 手机端抽屉
+
+  $("#btnTheme").addEventListener("click", () => {
+    const next = THEME_ORDER[(THEME_ORDER.indexOf(themePref()) + 1) % THEME_ORDER.length];
+    localStorage.setItem(THEME_KEY, next);
+    applyTheme();
+    toast("主题：" + THEME_LABEL[next], "ok");
+  });
+
+  // 跟随系统时，系统切换（macOS 日落变深色）要立刻生效；手动选定则忽略。
+  const mqLight = matchMedia("(prefers-color-scheme: light)");
+  if (mqLight.addEventListener) {
+    mqLight.addEventListener("change", () => {
+      if (themePref() === "auto") applyTheme();
+    });
+  }
+
+  $("#navBtn").addEventListener("click", () => {
+    const drawer = $("#navDrawer");
+    setNav(!(drawer && drawer.classList.contains("open")));
+  });
+  $("#navVeil").addEventListener("click", () => setNav(false));
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") setNav(false);
   });
 
   // ---------------------------------------------------------------------

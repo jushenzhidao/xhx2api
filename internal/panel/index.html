@@ -2,191 +2,285 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
 <title>小浣熊网关 · 控制台</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23e2611a'/%3E%3Cpath d='M9 13l2-4 3 2h4l3-2 2 4v7a5 5 0 01-5 5h-4a5 5 0 01-5-5z' fill='white'/%3E%3Ccircle cx='13' cy='17' r='1.6' fill='%23e2611a'/%3E%3Ccircle cx='19' cy='17' r='1.6' fill='%23e2611a'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/panel/style.css">
 </head>
 <body>
 <div id="app" hidden>
-  <header class="topbar">
+<div class="shell">
+
+  <!-- 侧栏导航。保留 id="tabs" 与 .tab[data-tab]：activateTab 的查询与事件委托都依赖它们，
+       换布局时只要这两处不变，切页逻辑一行都不用改。 -->
+  <nav class="nav" id="navDrawer" aria-label="主导航">
     <div class="brand">
-      <span class="logo">🦝</span>
-      <div>
+      <span class="logo" aria-hidden="true">🦝</span>
+      <div class="brand-text">
         <h1>小浣熊网关</h1>
-        <p class="sub">xiaohuanxiong.com · OpenAI / Anthropic / Responses 兼容</p>
+        <p class="sub" id="navSub">xiaohuanxiong.com</p>
       </div>
     </div>
-    <div class="topbar-right">
-      <span class="pill" id="ver">dev</span>
-      <span class="pill ok" id="health">运行中</span>
-      <button class="btn ghost" id="btn-refresh">刷新</button>
-      <button class="btn ghost" id="btn-logout">退出</button>
-    </div>
-  </header>
 
-  <nav class="tabs" id="tabs">
-    <button class="tab active" data-tab="accounts">账号</button>
-    <button class="tab" data-tab="models">模型</button>
-    <button class="tab" data-tab="requests">请求</button>
-    <button class="tab" data-tab="points">积分</button>
-    <button class="tab" data-tab="usage">用量</button>
-    <button class="tab" data-tab="logs">日志</button>
-    <button class="tab" data-tab="config">配置</button>
+    <ul class="tabs" id="tabs">
+      <li><button class="tab active" data-tab="accounts">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="8" cy="5.4" r="2.6"/><path d="M2.8 13.4c.6-2.5 2.7-3.9 5.2-3.9s4.6 1.4 5.2 3.9"/></svg>
+        账号</button></li>
+      <li><button class="tab" data-tab="models">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M8 1.9 14 5v6L8 14.1 2 11V5z"/><path d="M2 5l6 3.1L14 5M8 8.1v6"/></svg>
+        模型</button></li>
+      <li><button class="tab" data-tab="requests">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M1.8 8h3l1.8-4.2 2.6 8.4L11 8h3.2"/></svg>
+        请求</button></li>
+      <li><button class="tab" data-tab="points">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><rect x="2" y="4.2" width="12" height="8.6" rx="2"/><path d="M2 7h12M5.2 10.4h2.6"/></svg>
+        积分</button></li>
+      <li><button class="tab" data-tab="usage">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M2 13.4h12"/><path d="M4.4 13.4V8M8 13.4V3.6M11.6 13.4v-3.2"/></svg>
+        用量</button></li>
+      <li><button class="tab" data-tab="logs">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M2.4 4h11.2M2.4 8h11.2M2.4 12h6.4"/></svg>
+        日志</button></li>
+      <li><button class="tab" data-tab="config">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><circle cx="8" cy="8" r="2.1"/><path d="M8 1.7v1.8M8 12.5v1.8M1.7 8h1.8M12.5 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
+        配置</button></li>
+    </ul>
+
+    <!-- 状态灯：进程是否在跑、跑的是哪一版。运维最先看的两条，放在一直可见的位置。 -->
+    <div class="sig">
+      <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">运行中</span></div>
+      <div class="row"><span id="ver">dev</span></div>
+    </div>
   </nav>
 
-  <main>
-    <!-- 账号 -->
-    <section class="pane active" id="pane-accounts">
-      <div class="cards" id="cards"></div>
+  <div class="main">
+    <header class="topbar">
+      <button class="btn icon nav-btn" id="navBtn" aria-label="打开导航" aria-controls="navDrawer" aria-expanded="false">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.4 4h11.2M2.4 8h11.2M2.4 12h11.2" stroke-linecap="round"/></svg>
+      </button>
+      <span class="ttl" id="ttl">账号</span>
+      <span class="sep">/</span>
+      <span class="meta" id="subMeta">—</span>
+      <div class="topbar-right">
+        <button class="btn icon" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
+          <svg id="icoTheme" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
+        </button>
+        <button class="btn ghost" id="btn-refresh">刷新</button>
+        <button class="btn ghost" id="btn-logout">退出</button>
+      </div>
+    </header>
 
-      <div class="panel">
-        <div class="panel-head">
-          <h2>账号池</h2>
-          <div class="row-actions">
-            <button class="btn" data-action="checkin_all">全部签到</button>
-            <button class="btn" data-action="keepalive_all">保活续期</button>
-            <button class="btn" data-action="balance_all">刷新余额</button>
-            <button class="btn primary" id="btn-open-import">添加账号</button>
+    <main class="content">
+
+      <!-- ══ 账号 ══ -->
+      <section class="pane active" id="pane-accounts">
+        <div class="cards six" id="cards"></div>
+
+        <!-- 异常汇总条：全池健康时整条 hidden、不占位。计数口径与账号表的状态筛选一致，
+             否则「条上数了 3 个冷却、点进去只有 2 行」会被当成 bug。 -->
+        <div class="alertbar" id="alertBar" hidden>
+          <span class="pulse warn" id="alertDot"></span>
+          <span class="txt" id="alertText"></span>
+          <span class="chips" id="alertChips"></span>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>账号池 <span class="hint" id="accNote"></span></h2>
+            <div class="row-actions">
+              <button class="btn" data-action="checkin_all">全部签到</button>
+              <button class="btn" data-action="keepalive_all">保活续期</button>
+              <button class="btn" data-action="balance_all">刷新余额</button>
+              <button class="btn primary" id="btn-open-import">添加账号</button>
+            </div>
+          </div>
+
+          <!-- 工具栏全是内存运算（在当前 overview 快照上过滤/排序/分页），
+               不发新请求、不打乱 10 秒轮询节奏。 -->
+          <div class="toolbar">
+            <div class="search" id="accSearch">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="7" cy="7" r="4.3"/><path d="M10.3 10.3 14 14" stroke-linecap="round"/></svg>
+              <input id="accQ" type="search" placeholder="搜索昵称 / uid" autocomplete="off" spellcheck="false" aria-label="搜索账号">
+              <button class="clr" id="accQClear" type="button" title="清空搜索" aria-label="清空搜索">×</button>
+            </div>
+            <div class="chips" id="accStatusChips"></div>
+            <span class="grow"></span>
+            <label class="sel-note">排序
+              <select id="accSort" aria-label="排序方式">
+                <option value="default">异常优先</option>
+                <option value="credits_desc">积分 ↓</option>
+                <option value="credits_asc">积分 ↑</option>
+                <option value="fails_desc">失败次数 ↓</option>
+                <option value="success_desc">成功次数 ↓</option>
+                <option value="last_used">最近使用</option>
+                <option value="name">昵称</option>
+              </select>
+            </label>
+            <label class="sel-note">每页
+              <select id="accSize" aria-label="每页条数">
+                <option value="20">20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+                <option value="200">200</option>
+                <option value="0">全部</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="table-wrap acc-cards">
+            <table class="grid" id="accounts-table">
+              <thead>
+                <tr>
+                  <th>账号</th><th>积分</th><th>签到</th><th>状态</th>
+                  <th>在途</th><th>请求</th><th>成功率</th><th>延迟</th><th>操作</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+
+          <div class="pager" id="accPager">
+            <span id="accPageInfo"></span>
+            <span class="grow"></span>
+            <button class="pg" id="accPrev" type="button">上一页</button>
+            <span id="accPageNum"></span>
+            <button class="pg" id="accNext" type="button">下一页</button>
+          </div>
+
+          <p class="hint">「禁用」不参与选号但仍会签到/续期；「暂停」为临时摘流量；「解冻」清掉冷却与熔断计数。</p>
+        </div>
+
+        <div class="panel" id="scheduler-panel">
+          <div class="panel-head"><h2>调度器</h2></div>
+          <div id="scheduler-body" class="kv-grid"></div>
+        </div>
+      </section>
+
+      <!-- ══ 模型 ══ -->
+      <section class="pane" id="pane-models">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>模型目录 <span class="hint" id="models-count"></span></h2>
+            <div class="row-actions">
+              <input type="text" id="models-search" placeholder="搜索模型名 / ID" autocomplete="off">
+              <label class="chk"><input type="checkbox" id="models-free-only"> 只看免费</label>
+              <button class="btn" id="btn-models-refresh">从上游刷新</button>
+            </div>
+          </div>
+          <p class="hint" id="models-meta"></p>
+          <div class="model-grid" id="models-grid"></div>
+          <p class="hint" id="models-billing"></p>
+        </div>
+      </section>
+
+      <!-- ══ 请求 ══ -->
+      <section class="pane" id="pane-requests">
+        <div class="cards" id="req-cards"></div>
+        <div class="panel">
+          <div class="panel-head"><h2>最近请求</h2></div>
+          <div class="table-wrap">
+            <table class="grid" id="requests-table">
+              <thead>
+                <tr><th>时间</th><th>协议</th><th>模型</th><th>账号</th><th>状态</th>
+                    <th>耗时</th><th>首字节</th><th>tokens</th><th>备注</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
           </div>
         </div>
-        <div class="table-wrap">
-          <table class="grid" id="accounts-table">
-            <thead>
-              <tr>
-                <th>账号</th><th>积分</th><th>签到</th><th>状态</th>
-                <th>在途</th><th>请求</th><th>成功率</th><th>延迟</th><th>操作</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
+      </section>
+
+      <!-- ══ 积分 ══ -->
+      <section class="pane" id="pane-points">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>积分来源</h2>
+            <button class="btn ghost" id="btn-points-refresh">刷新</button>
+          </div>
+          <p class="hint">上游是「发放制」不是任务制：每日 300 分 0 点自动发；新人礼、桌面端登录奖励
+            和移动端登录奖励各是一次性。下面把每个号的到账情况、消耗速度和还能不能补领列出来。</p>
+          <div class="table-wrap">
+            <table class="grid" id="points-table">
+              <thead><tr>
+                <th>账号</th><th>余额</th><th>近 7 天消耗</th><th>预计可用</th>
+                <th>每日 300</th><th>新人礼</th><th>桌面端奖励</th><th>移动端奖励</th>
+                <th>有效期至</th><th></th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="hint" id="points-note"></p>
         </div>
-        <p class="hint">「禁用」不参与选号但仍会签到/续期；「暂停」为临时摘流量；「解冻」清掉冷却与熔断计数。</p>
-      </div>
+      </section>
 
-      <div class="panel" id="scheduler-panel">
-        <div class="panel-head"><h2>调度器</h2></div>
-        <div id="scheduler-body" class="kv-grid"></div>
-      </div>
-    </section>
-
-    <!-- 模型 -->
-    <section class="pane" id="pane-models">
-      <div class="panel">
-        <div class="panel-head">
-          <h2>模型目录 <span class="hint" id="models-count"></span></h2>
-          <div class="row-actions">
-            <input type="text" id="models-search" placeholder="搜索模型名 / ID" autocomplete="off">
-            <label class="chk"><input type="checkbox" id="models-free-only"> 只看免费</label>
-            <button class="btn" id="btn-models-refresh">从上游刷新</button>
+      <!-- ══ 用量 ══ -->
+      <section class="pane" id="pane-usage">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>用量统计</h2>
+            <button class="btn ghost" id="btn-usage-reset">重置</button>
+          </div>
+          <div class="kv-grid" id="usage-total"></div>
+          <h3 class="subhead">按账号</h3>
+          <div class="table-wrap">
+            <table class="grid" id="usage-accounts">
+              <thead><tr><th>账号</th><th>请求</th><th>失败</th><th>输入 tokens</th><th>输出 tokens</th><th>最近使用</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <h3 class="subhead">按日</h3>
+          <div class="table-wrap">
+            <table class="grid" id="usage-days">
+              <thead><tr><th>日期</th><th>请求</th><th>失败</th><th>输入 tokens</th><th>输出 tokens</th></tr></thead>
+              <tbody></tbody>
+            </table>
           </div>
         </div>
-        <p class="hint" id="models-meta"></p>
-        <div class="model-grid" id="models-grid"></div>
-        <p class="hint" id="models-billing"></p>
-      </div>
-    </section>
+      </section>
 
-    <!-- 请求 -->
-    <section class="pane" id="pane-requests">
-      <div class="cards" id="req-cards"></div>
-      <div class="panel">
-        <div class="panel-head"><h2>最近请求</h2></div>
-        <div class="table-wrap">
-          <table class="grid" id="requests-table">
-            <thead>
-              <tr><th>时间</th><th>协议</th><th>模型</th><th>账号</th><th>状态</th>
-                  <th>耗时</th><th>首字节</th><th>tokens</th><th>备注</th></tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <!-- 用量 -->
-    <section class="pane" id="pane-points">
-      <div class="panel">
-        <div class="panel-head">
-          <h2>积分来源</h2>
-          <button class="btn ghost" id="btn-points-refresh">刷新</button>
-        </div>
-        <p class="hint">上游是「发放制」不是任务制：每日 300 分 0 点自动发；新人礼、桌面端登录奖励
-          和移动端登录奖励各是一次性。下面把每个号的到账情况、消耗速度和还能不能补领列出来。</p>
-        <div class="table-wrap">
-          <table class="grid" id="points-table">
-            <thead><tr>
-              <th>账号</th><th>余额</th><th>近 7 天消耗</th><th>预计可用</th>
-              <th>每日 300</th><th>新人礼</th><th>桌面端奖励</th><th>移动端奖励</th>
-              <th>有效期至</th><th></th>
-            </tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-        <p class="hint" id="points-note"></p>
-      </div>
-    </section>
-
-    <section class="pane" id="pane-usage">
-      <div class="panel">
-        <div class="panel-head">
-          <h2>用量统计</h2>
-          <button class="btn ghost" id="btn-usage-reset">重置</button>
-        </div>
-        <div class="kv-grid" id="usage-total"></div>
-        <h3 class="subhead">按账号</h3>
-        <div class="table-wrap">
-          <table class="grid" id="usage-accounts">
-            <thead><tr><th>账号</th><th>请求</th><th>失败</th><th>输入 tokens</th><th>输出 tokens</th><th>最近使用</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-        <h3 class="subhead">按日</h3>
-        <div class="table-wrap">
-          <table class="grid" id="usage-days">
-            <thead><tr><th>日期</th><th>请求</th><th>失败</th><th>输入 tokens</th><th>输出 tokens</th></tr></thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <!-- 日志 -->
-    <section class="pane" id="pane-logs">
-      <div class="panel">
-        <div class="panel-head">
-          <h2>运行日志</h2>
-          <label class="switch"><input type="checkbox" id="logs-auto" checked> 自动刷新</label>
-        </div>
-        <pre class="logbox" id="logbox"></pre>
-      </div>
-    </section>
-
-    <!-- 配置 -->
-    <section class="pane" id="pane-config">
-      <div class="panel">
-        <div class="panel-head">
-          <h2>配置</h2>
-          <div class="row-actions">
-            <span class="hint" id="config-path"></span>
-            <button class="btn" id="btn-config-reload">重新读取</button>
-            <button class="btn primary" id="btn-config-save">保存</button>
+      <!-- ══ 日志 ══ -->
+      <section class="pane" id="pane-logs">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>运行日志</h2>
+            <label class="switch"><input type="checkbox" id="logs-auto" checked> 自动刷新</label>
           </div>
+          <pre class="logbox" id="logbox"></pre>
         </div>
-        <div class="seg" id="config-view">
-          <button class="seg-btn active" data-view="form">表单</button>
-          <button class="seg-btn" data-view="json">JSON</button>
-        </div>
-        <p class="hint">标了 <span class="tag warn">需重启</span> 的字段改完要重启进程；
-          其余保存即热生效。<b>只在表单里出现的字段才会被写入</b>，没列的键保持原样。</p>
-        <div id="config-form"></div>
-        <textarea id="config-editor" spellcheck="false" hidden></textarea>
-        <div id="config-msg" class="hint"></div>
-      </div>
-    </section>
-  </main>
+      </section>
 
-  <!-- 添加账号弹层 -->
+      <!-- ══ 配置 ══ -->
+      <section class="pane" id="pane-config">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>配置</h2>
+            <div class="row-actions">
+              <span class="hint" id="config-path"></span>
+              <button class="btn" id="btn-config-reload">重新读取</button>
+              <button class="btn primary" id="btn-config-save">保存</button>
+            </div>
+          </div>
+          <div class="seg" id="config-view">
+            <button class="seg-btn active" data-view="form">表单</button>
+            <button class="seg-btn" data-view="json">JSON</button>
+          </div>
+          <p class="hint">标了 <span class="tag warn">需重启</span> 的字段改完要重启进程；
+            其余保存即热生效。<b>只在表单里出现的字段才会被写入</b>，没列的键保持原样。</p>
+          <div id="config-form"></div>
+          <textarea id="config-editor" spellcheck="false" hidden></textarea>
+          <div id="config-msg" class="hint"></div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<!-- 抽屉遮罩：只在手机端显示，点一下关导航 -->
+<div class="nav-veil" id="navVeil"></div>
+
+  <!-- ══ 添加账号弹层 ══ -->
   <div class="modal" id="modal-import" hidden>
     <div class="modal-box">
       <div class="modal-head">
@@ -210,7 +304,7 @@
       </div>
 
       <div class="mode" id="mode-qr">
-        <p class="hint" style="color:#b06d00;background:#fff6e0;padding:8px 12px;border-radius:8px">
+        <p class="note warn">
           <b>当前不可用</b>：上游已改版——<code>/login/mp</code> 落地页返回 404（2026-10-26 实测），
           而轮询端点仍对任意 code 回 <code>pending</code>，说明二维码内容改由上游生成。
           请改用「浏览器授权」或「粘贴凭证」。
@@ -227,11 +321,11 @@
       <div class="mode" id="mode-device">
         <p class="hint">点「打开授权页」→ 登录 → 确认授权。浏览器会回跳到
           <code id="callback-base">—</code>，网关自动换票入池。</p>
-        <p class="hint" style="background:#f7f8fa;padding:8px 12px;border-radius:8px">
+        <p class="note">
           回跳后如果页面打不开（例如面板在服务器上、或用手机完成授权），
           <b>把地址栏那一整条链接复制到「粘贴凭证」里</b>，效果完全一样——那条链接里的 code 就是凭证。
         </p>
-        <p class="hint" id="device-warn" hidden style="color:#b06d00"></p>
+        <p class="hint" id="device-warn" hidden></p>
         <div class="row-actions">
           <button class="btn primary" id="btn-device-start">打开授权页</button>
           <button class="btn" id="btn-device-copy">复制授权链接</button>
@@ -242,7 +336,7 @@
       <div class="mode" id="mode-client">
         <p class="hint">直接读本机「商汤小浣熊」桌面客户端留下的凭据，省得手工挖 token。
           <b>只读</b>：不改任何文件、不删任何东西。</p>
-        <p class="hint" id="client-empty" hidden style="background:#f7f8fa;padding:8px 12px;border-radius:8px">
+        <p class="note" id="client-empty" hidden>
           本机没找到客户端凭据。装过客户端并登录过才会写这个文件；面板部署在服务器上时这里是空的属于正常，
           用「浏览器授权」或「手机号」即可。
         </p>
@@ -272,8 +366,8 @@
           仍是空对象），也不给双方任何积分。留着只为上游恢复该功能时能直接用。</p>
         <p class="hint" id="sms-status"></p>
         <div id="captcha-element"></div>
-        <details class="hint" id="sms-manual" style="margin-top:6px">
-          <summary style="cursor:pointer">人机验证加载不出来？手动填票据</summary>
+        <details class="hint" id="sms-manual">
+          <summary>人机验证加载不出来？手动填票据</summary>
           <p>面板域名不在上游验证码白名单时，控件会初始化失败（服务器部署常见）。
              此时在浏览器打开 <code>xiaohuanxiong.com/login</code> → 手机号登录 → 点「发送验证码」，
              F12 在 Network 里找 <code>send_sms</code> 请求，复制请求体里的 <code>captcha_param</code> 粘到下面。</p>
