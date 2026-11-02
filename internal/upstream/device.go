@@ -149,18 +149,30 @@ func (c *Client) BindDevice(ctx context.Context, a *auth.Auth) (string, error) {
 	return bound, nil
 }
 
-// alreadyBound 判断上游的「已经绑过了」。
+// alreadyBound 判断上游的「这个会话已经有设备了」。
 //
-// 上游把它放在 HTTP 400 + code 100002 里（不是 200，也不是 409），
-// 所以只能看正文。code 既有数字也有字符串形态，两种都认。
+// 真实响应长这样（2026-11-03 实测，不是 200 也不是 409）：
+//
+//	HTTP 400 {"code":100002,"message":"params_invalid_error",
+//	          "details":"param device_session_mismatch invalid"}
+//
+// 语义是「session 已绑定另一个设备，不能再挂新的」——也就是这个号本来就有
+// 可信设备，正是我们要的结果。把它当失败会让本地状态永远补不上，面板一直
+// 显示「未绑设备」，而这号其实是好的。
+//
+// 判据要求 100002 **加上**具体语义词，避免把真错误当成已绑：吞掉真错误比
+// 误报更危险（面板显示成功，号其实是坏的）。
 func alreadyBound(body string) bool {
 	if !strings.Contains(body, "100002") {
 		return false
 	}
 	lower := strings.ToLower(body)
-	// 双重确认：避免别的 400 恰好也带了 100002 这个子串。
-	return strings.Contains(lower, "already") || strings.Contains(body, "已绑定") ||
-		strings.Contains(lower, "exist") || strings.Contains(lower, "bound")
+	for _, sig := range []string{"already", "exist", "bound", "mismatch", "已绑定"} {
+		if strings.Contains(lower, sig) || strings.Contains(body, sig) {
+			return true
+		}
+	}
+	return false
 }
 
 // effectiveVersion 当前出站客户端版本。

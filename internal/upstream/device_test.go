@@ -176,7 +176,9 @@ func TestBindDeviceRequiresDeviceID(t *testing.T) {
 func TestBindDeviceAlreadyBoundIsNotFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"code":100002,"message":"device already bound to current session"}`))
+		// 线上真实文案（2026-11-03）：不是 "already bound"，而是
+		// params_invalid_error + device_session_mismatch。
+		_, _ = w.Write([]byte(`{"code":100002,"message":"params_invalid_error","details":"param device_session_mismatch invalid"}`))
 	}))
 	defer srv.Close()
 
