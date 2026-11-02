@@ -36,7 +36,12 @@ type Config struct {
 	KeepaliveHours   []int
 	CheckinEnabled   bool
 	KeepaliveEnabled bool
-	// BalanceRefreshMinutes 余额刷新周期（分钟），<=0 关闭。
+	// BalanceRefreshEnabled 控制余额刷新循环。
+	//
+	// 单独一个开关而不是「把周期设 0」：0 在 normalize 里要兜底成默认 5
+	// （配置缺省时就是 0），两个语义挤在一个字段上必然打架。
+	BalanceRefreshEnabled bool
+	// BalanceRefreshMinutes 余额刷新周期（分钟），<=0 时回落到 5。
 	BalanceRefreshMinutes int
 	// IncludeDisabled 让保号类任务对已禁用账号也执行。
 	// 语义：面板「禁用」= 不参与选号，不等于「停止保号」——被禁用的号仍然需要
@@ -147,7 +152,18 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context) {
 	}
 	s.RefreshBalances(ctx)
 	for {
-		interval := time.Duration(s.Config().BalanceRefreshMinutes) * time.Minute
+		cfg := s.Config()
+		// 关闭（或周期非法）时不退出循环，而是挂起一分钟再看：
+		// 面板改开关要能热生效，退出 goroutine 就再也起不来了。
+		if !cfg.BalanceRefreshEnabled {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Minute):
+				continue
+			}
+		}
+		interval := time.Duration(cfg.BalanceRefreshMinutes) * time.Minute
 		if interval <= 0 {
 			interval = 5 * time.Minute
 		}

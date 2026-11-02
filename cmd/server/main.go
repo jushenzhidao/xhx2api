@@ -163,12 +163,11 @@ func main() {
 	sch := scheduler.New(p, up, scheduler.Config{
 		CheckinHours: cfg.Schedule.CheckinHours, KeepaliveHours: cfg.Schedule.KeepaliveHours,
 		CheckinEnabled: cfg.Schedule.CheckinEnabled, KeepaliveEnabled: cfg.Schedule.KeepaliveEnabled,
-		BalanceRefreshMinutes: 0, IncludeDisabled: cfg.Schedule.IncludeDisabledInTasks,
-		NewAccountGraceDays: cfg.Schedule.NewAccountGraceDays, Concurrency: cfg.Schedule.Concurrency,
+		BalanceRefreshEnabled: cfg.Schedule.BalanceRefreshEnabled,
+		BalanceRefreshMinutes: cfg.Schedule.BalanceRefreshMinutes,
+		IncludeDisabled:       cfg.Schedule.IncludeDisabledInTasks,
+		NewAccountGraceDays:   cfg.Schedule.NewAccountGraceDays, Concurrency: cfg.Schedule.Concurrency,
 	})
-	if cfg.Schedule.BalanceRefreshEnabled {
-		sch.Configure(func(c *scheduler.Config) { c.BalanceRefreshMinutes = cfg.Schedule.BalanceRefreshMinutes })
-	}
 
 	// 面板。
 	panelStarted := time.Now()
@@ -192,7 +191,7 @@ func main() {
 			if err != nil {
 				return nil, err
 			}
-			applyHotConfig(next, live, p, up, rec, requestLog)
+			applyHotConfig(next, live, p, up, rec, requestLog, sch)
 			return restart, nil
 		},
 		Usage: rec, RequestLog: requestLog,
@@ -257,9 +256,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
-	if cfg.Schedule.BalanceRefreshEnabled {
-		go sch.StartBalanceRefresh(ctx)
-	}
+	// 无条件启动：开关在循环内部判，面板改开关才能热生效。
+	go sch.StartBalanceRefresh(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -290,7 +288,7 @@ func main() {
 
 // applyHotConfig 把能热改的字段应用到运行中的对象。
 func applyHotConfig(c *Config, live *livecfg.Holder, p *pool.Pool, up *upstream.Client,
-	rec *usage.Recorder, requestLog *reqlog.Recorder) {
+	rec *usage.Recorder, requestLog *reqlog.Recorder, sch *scheduler.Scheduler) {
 	text, _ := prompt.LoadText(c.Prompt.File)
 	live.Store(livecfg.Snapshot{
 		APIKey: c.APIKey, SoftCooldown: int64(c.softRateDur),
@@ -319,6 +317,31 @@ func applyHotConfig(c *Config, live *livecfg.Holder, p *pool.Pool, up *upstream.
 		pc.IdleWeightMax = c.Pool.IdleWeightMax
 	})
 	up.SetIdentity(c.Upstream.UserAgent, c.Upstream.ClientVersion)
+	// 调度参数也热更新：以前这里完全不碰 scheduler，面板上改签到时点/并发/
+	// 余额周期全部「保存成功但不生效」，要重启才看得出效果——用户以为配置坏了。
+	if sch != nil {
+		sch.Configure(func(sc *scheduler.Config) {
+			sc.CheckinEnabled = c.Schedule.CheckinEnabled
+			sc.KeepaliveEnabled = c.Schedule.KeepaliveEnabled
+			sc.BalanceRefreshEnabled = c.Schedule.BalanceRefreshEnabled
+			// 小时列表为空时保留原值：空列表会被 normalize 当成「没配置」补默认，
+			// 那等于把用户刚清空的设置又偷偷塞回去。
+			if len(c.Schedule.CheckinHours) > 0 {
+				sc.CheckinHours = c.Schedule.CheckinHours
+			}
+			if len(c.Schedule.KeepaliveHours) > 0 {
+				sc.KeepaliveHours = c.Schedule.KeepaliveHours
+			}
+			if c.Schedule.BalanceRefreshMinutes > 0 {
+				sc.BalanceRefreshMinutes = c.Schedule.BalanceRefreshMinutes
+			}
+			sc.IncludeDisabled = c.Schedule.IncludeDisabledInTasks
+			sc.NewAccountGraceDays = c.Schedule.NewAccountGraceDays
+			if c.Schedule.Concurrency > 0 {
+				sc.Concurrency = c.Schedule.Concurrency
+			}
+		})
+	}
 	log.Printf("配置已热更新：密钥=%s 策略=%s 软冷却=%s", maskKey(c.APIKey), strategy, c.Cooldown.SoftRate)
 }
 
