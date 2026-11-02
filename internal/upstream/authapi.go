@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/rsfree/xhx2api/internal/auth"
 )
@@ -338,6 +339,19 @@ func (c *Client) finishLogin(ctx context.Context, account *auth.Auth) (*auth.Aut
 			account.Nickname = nick
 		}
 	}
+	// 顺手把「可信设备绑定」状态取回来。
+	//
+	// 不取的话，导入界面只会说「成功」，而 bound=false 的号**永远没有每日
+	// 积分**（实测 11 个号里 9 个如此）。用户要等到第二天签到才发现，那时
+	// 已经白等一轮。这里多花一次 user_info，换导入当场就把话说清楚。
+	// 取不到不影响登录本身：只是不知道，按「未知」处理，不编结论。
+	if prof, perr := c.UserProfile(ctx, account); perr == nil && prof.DeviceState != "" {
+		account.DeviceBound = prof.DeviceState
+		account.DeviceCheckedAt = time.Now().Format(time.RFC3339)
+		if !prof.CreatedAt.IsZero() {
+			account.RegisterAt = prof.CreatedAt.Format(time.RFC3339)
+		}
+	}
 	if account.UID == "" {
 		return nil, &Error{Kind: ErrClient, Status: 400, Msg: auth.ErrNoIdentity.Error()}
 	}
@@ -407,8 +421,18 @@ func (c *Client) iamCall(ctx context.Context, path string, body any, action stri
 	if origin == "" {
 		origin = Origin
 	}
+	// 带上 x-client-* 客户端标识。
+	//
+	// 曾经只发 Accept：上游据此把会话当成「非客户端会话」，user_info 里
+	// trusted_device 变成 device_id="" / bound=false / needs_bind=true ——
+	// 而 bound=false 的号**永远拿不到每日积分**（2026-11-03 实测 11 个号里
+	// 9 个如此，全部是接码 IAM 通道导入的；同批走桌面端通道/授权回调的号
+	// bound=true，天天有 300）。
+	//
+	// 补头是安全的：iam/confirm 带与不带都是 {"code":0}，
+	// user_info 也是 200（2026-11-03 线上实测）。
 	resp, err := c.doJSON(ctx, nil, http.MethodPost, strings.TrimRight(origin, "/")+IamBase+path, body,
-		map[string]string{"Accept": "application/json"})
+		c.clientIDHeaders())
 	if err != nil {
 		return nil, err
 	}

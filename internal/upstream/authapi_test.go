@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -351,4 +352,50 @@ func decryptCFB(ciphertext, iv []byte, key string) (string, error) {
 	out := make([]byte, len(ciphertext))
 	cipher.NewCFBDecrypter(block, iv).XORKeyStream(out, ciphertext)
 	return string(out), nil
+}
+
+// IAM 通道的请求必须带 x-client-* 客户端标识。
+//
+// 这曾经是「账号永远拿不到每日积分」的根因：只发 Accept 头时，上游把会话
+// 当成非客户端会话，user_info 返回 trusted_device{device_id:"", bound:false,
+// needs_bind:true}，而 bound=false 的号永远不会有 daily_grant
+// （2026-11-03 实测：11 个号里 9 个 unbound，全是接码 IAM 通道导入的）。
+//
+// 断言用真实 HTTP 桩而不是 mock 头 map：补头这件事的意义就在于「服务端能
+// 看到」，只测「我们构造了 map」证明不了任何事。
+func TestIamCallSendsClientIdentity(t *testing.T) {
+	var mu sync.Mutex
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = r.Header.Clone()
+		mu.Unlock()
+		fmt.Fprint(w, `{"code":"OK","message":"success","data":{}}`)
+	}))
+	defer srv.Close()
+
+	c := New()
+	c.SetAPIHosts("", srv.URL) // IAM 走 origin
+	if _, err := c.iamCall(context.Background(), IamSmsSendPath, map[string]string{"x": "y"}, "测试"); err != nil {
+		t.Fatalf("iamCall 失败: %v", err)
+	}
+
+	mu.Lock()
+	h := got
+	mu.Unlock()
+	if h == nil {
+		t.Fatal("服务端没收到请求")
+	}
+	for name, want := range map[string]string{
+		"X-Client-Name":     "@raccoon/office-desktop",
+		"X-Client-Platform": "desktop-windows-x64",
+		"X-Client-Channel":  "official",
+	} {
+		if v := h.Get(name); v != want {
+			t.Errorf("%s = %q，应为 %q（缺这个上游会把会话当成非客户端会话，账号永远没有每日积分）", name, v, want)
+		}
+	}
+	if h.Get("X-Client-Version") == "" {
+		t.Error("X-Client-Version 为空")
+	}
 }
