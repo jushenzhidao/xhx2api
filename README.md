@@ -673,6 +673,25 @@ go run ./cmd/livecheck -base ... -key ... -all-models
   unbound，面板会标「未绑设备」——这不是故障，是上游不认这种登录态，得去官方客户端
   登录一次完成绑定。当天注册的新号报「待发放」，设备态查不到的报「待定」，
   都不谎报失败。
+- **出口按账号隔离（可选）**：上游的风控打在**出口 IP + 路径**上，不是凭证。
+  2026-11-02 实测：ai-prod 连续给 11 个号查积分后，`/api/web/points/` 整个前缀
+  回 403（空 body + `X-TT-System-Error: 3`），同 token 换台机器 200，连不带 token
+  的请求也 403。所以支持 SOCKS5 按账号粘性出口：
+
+  ```json
+  "upstream": {
+    "proxy": {
+      "enabled": true,
+      "template": "socks5h://poolclient-{account}:PASSWORD@pool.livetest.cn:2090",
+      "scope": "points"
+    }
+  }
+  ```
+
+  `{account}` 换成账号 uid，**同一账号恒定同一出口**；`scope` 默认 `points`
+  （只让积分域走代理，聊天保持直连），`all` 则全部走。启动日志会逐账号打印
+  `[proxy] 账号=… 来源=… 出口=IP`，失败时同样带上，便于确认是哪个出口被封。
+  代理连不通判 `gateway`（不罚号、不熔断），不会把链路故障放大成账号熔断。
 - **归档不含正文**：请求体里有用户的代码与对话，落盘等于把隐私写进运维目录。
 - **`max_tokens` 有下限（2048）+ 空正文自动加额**：上游把思考 token 算进输出额度。
   真号实测 `sn-sensenova-6-8-flash`：`max_tokens=16/512` 时思考吃满、正文空且

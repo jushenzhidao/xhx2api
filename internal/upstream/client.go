@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"regexp"
@@ -364,6 +365,13 @@ type Client struct {
 	// 出站代理（egress）：nil = 直连。
 	transportMu sync.RWMutex
 	dialer      func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// proxy 是「按账号粘性出口」的 SOCKS5 代理池。永远非 nil，未启用时
+	// usable() 为 false，clientFor 直接回落到上面的共享 client。
+	proxy *proxyManager
+	// shortTimeout 是短请求的总超时。共享 client 上有一份（HTTP.Timeout），
+	// 按账号的 client 是临时造的，得单独记一份。
+	shortTimeout time.Duration
 }
 
 type refreshFlight struct {
@@ -381,6 +389,8 @@ func New() *Client {
 		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		StreamHTTP:    &http.Client{Transport: tr},
 		headerTimeout: 120 * time.Second,
+		shortTimeout:  120 * time.Second,
+		proxy:         newProxyManager(),
 		llm:           LLMBase,
 		auth:          AuthBase,
 		points:        PointsBase,
@@ -414,8 +424,11 @@ func newTransport(headerTimeout time.Duration) *http.Transport {
 func (c *Client) SetTimeouts(short, header, idle time.Duration) {
 	c.timeoutMu.Lock()
 	defer c.timeoutMu.Unlock()
-	if short > 0 && c.HTTP != nil {
-		c.HTTP.Timeout = short
+	if short > 0 {
+		c.shortTimeout = short
+		if c.HTTP != nil {
+			c.HTTP.Timeout = short
+		}
 	}
 	if header > 0 {
 		for _, hc := range []*http.Client{c.HTTP, c.StreamHTTP} {
@@ -582,6 +595,58 @@ func orDefault(value, fallback string) string {
 	return value
 }
 
+// clientKind 区分三种出站客户端：短请求 / 流式 / 生图。
+//
+// 它们的差别只有超时：短请求有总超时、流式只看首字节、生图两个都不能有
+// （20-200s）。代理场景下每个账号每种各要一条 transport，所以类型要显式。
+type clientKind int
+
+const (
+	kindShort clientKind = iota
+	kindStream
+	kindImage
+)
+
+// timeouts 取当前的超时参数（短请求总超时 + 等响应头上限）。
+func (c *Client) timeouts() (short, header time.Duration) {
+	c.timeoutMu.RLock()
+	defer c.timeoutMu.RUnlock()
+	return c.shortTimeout, c.headerTimeout
+}
+
+// clientFor 按「请求所属账号」选择出站客户端。
+//
+// 代理启用且 ctx 上带了账号时，用该账号专属的 transport（SOCKS5 用户名里
+// 带账号 ⇒ 出口恒定）。否则回落到共享 client——即代理未启用时行为与改造前
+// 完全一致，这也是所有既有测试的前提。
+func (c *Client) clientFor(ctx context.Context, kind clientKind, rawURL string) *http.Client {
+	if uid := accountUID(ctx); uid != "" && c.proxy.usable() && c.proxy.appliesTo(rawURL) {
+		short, header := c.timeouts()
+		total := short
+		if kind == kindImage {
+			header = 0 // 生图耗时 20-200s，响应头超时会卡在边上
+		}
+		if kind == kindStream {
+			total = 0 // 流式不设总超时，靠流内空闲看门狗
+		}
+		cl, err := c.proxy.clientFor(uid, header, total)
+		if err == nil {
+			return cl
+		}
+		// 建不出代理客户端时回落到直连而不是直接失败：直连至少可能还能用，
+		// 直接回错会让一次配置笔误变成全站不可用。
+		log.Printf("[proxy] 账号 %s 代理客户端不可用，回落到直连：%v", uid, err)
+	}
+	switch kind {
+	case kindStream:
+		return c.streamClient()
+	case kindImage:
+		return c.imageClient()
+	default:
+		return c.httpClient()
+	}
+}
+
 func (c *Client) httpClient() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
@@ -607,14 +672,24 @@ func (c *Client) do(req *http.Request) (*apiResponse, error) {
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", c.currentUA())
 	}
-	resp, err := c.httpClient().Do(req)
+	resp, err := c.clientFor(req.Context(), kindShort, req.URL.String()).Do(req)
 	if err != nil {
 		if req.Context().Err() != nil {
 			return nil, req.Context().Err()
 		}
+		c.logProxiedFailure(req.Context(), req.Method, req.URL.Path, 0)
+		// 代理连不通归 gateway：不罚号、不熔断。代理挂了却去罚账号，
+		// 等于把链路故障放大成「账号全灭」（gateway 只做 15s 短回避）。
+		var pde *proxyDialError
+		if errors.As(err, &pde) {
+			return nil, &Error{Kind: ErrGateway, Status: 502, Msg: pde.Error()}
+		}
 		return nil, &Error{Kind: ErrServer, Status: 502, Msg: "无法连接小浣熊，请检查网络或代理设置"}
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		c.logProxiedFailure(req.Context(), req.Method, req.URL.Path, resp.StatusCode)
+	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
 		return nil, &Error{Kind: ErrServer, Status: 502, Msg: "读取小浣熊响应失败"}
@@ -623,7 +698,11 @@ func (c *Client) do(req *http.Request) (*apiResponse, error) {
 }
 
 // doJSON 发请求：body 非 nil 时按 JSON 序列化，headers 原样写入。
-func (c *Client) doJSON(ctx context.Context, method, url string, body any, headers map[string]string) (*apiResponse, error) {
+//
+// a 只用于选出站（按账号粘性代理），不影响任何请求头；登录类请求没有账号，
+// 传 nil 即走共享 client。
+func (c *Client) doJSON(ctx context.Context, a *auth.Auth, method, url string, body any, headers map[string]string) (*apiResponse, error) {
+	ctx = withAccount(ctx, uidOf(a))
 	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -790,7 +869,7 @@ func applyRefreshedUID(a *auth.Auth, uid string) {
 
 // refreshOnce 真的打一次续期接口并返回新票（不写回账号）。
 func (c *Client) refreshOnce(ctx context.Context, a *auth.Auth) (token, refresh string, exp int64, uid string, err error) {
-	resp, err := c.doJSON(ctx, http.MethodPost, c.authBase()+RefreshPath,
+	resp, err := c.doJSON(ctx, a, http.MethodPost, c.authBase()+RefreshPath,
 		map[string]string{"refresh_token": a.RefreshTokenValue()}, c.clientIDHeaders())
 	if err != nil {
 		return "", "", 0, "", err
@@ -832,7 +911,7 @@ func (c *Client) GetUserInfo(ctx context.Context, a *auth.Auth) (uid, nickname, 
 		// 少了这一步，未确认的票会静默回落到 JWT 里的 pu-… 主体（uid 看着有值、
 		// 实际是 IAM 主体），账号入池后每个请求都是 400 iam_confirm_required。
 		fetch := func() (bool, error) {
-			resp, uerr := c.doJSON(ctx, http.MethodGet, c.authBase()+UserInfoPath, nil,
+			resp, uerr := c.doJSON(ctx, a, http.MethodGet, c.authBase()+UserInfoPath, nil,
 				map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token})
 			if uerr != nil {
 				return false, uerr
@@ -878,7 +957,7 @@ func (c *Client) GetUserInfo(ctx context.Context, a *auth.Auth) (uid, nickname, 
 func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte, turnTitle string) (io.ReadCloser, int, []byte, error) {
 	url := c.llmBase() + ChatPath
 	// 派生一个可取消的 ctx：流内空闲看门狗靠它把卡死的流掐断。
-	reqCtx, cancel := context.WithCancel(ctx)
+	reqCtx, cancel := context.WithCancel(withAccount(ctx, a.UID))
 	handedOff := false
 	defer func() {
 		// 没把流交出去（早退/报错）时立刻回收，避免计时器和连接悬着。
@@ -905,7 +984,7 @@ func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte, turn
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := c.streamClient().Do(req)
+	resp, err := c.clientFor(reqCtx, kindStream, url).Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, 499, nil, &Error{Kind: ErrClient, Status: 499, Msg: "客户端已断开"}
@@ -916,6 +995,11 @@ func (c *Client) ChatStream(ctx context.Context, a *auth.Auth, body []byte, turn
 		// 超时换号没有意义（换个号一样慢），所以归到 gateway：快速失败、不罚号。
 		if isTimeoutErr(err) {
 			return nil, 504, nil, &Error{Kind: ErrGateway, Status: 504, Msg: c.timeoutMessage()}
+		}
+		var pde *proxyDialError
+		if errors.As(err, &pde) {
+			c.logProxiedFailure(reqCtx, req.Method, req.URL.Path, 0)
+			return nil, 502, nil, &Error{Kind: ErrGateway, Status: 502, Msg: pde.Error()}
 		}
 		return nil, 502, nil, &Error{Kind: ErrServer, Status: 502, Msg: "无法连接小浣熊，请检查网络或代理设置"}
 	}

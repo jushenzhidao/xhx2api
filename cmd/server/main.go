@@ -72,6 +72,7 @@ func main() {
 	up.SetAPIHosts(cfg.Upstream.PointsBase, cfg.Upstream.Origin)
 	up.SetTimeouts(cfg.upstreamShort, cfg.upstreamHeader, cfg.upstreamIdle)
 	up.SetIdentity(cfg.Upstream.UserAgent, cfg.Upstream.ClientVersion)
+	up.SetProxy(proxyConfigOf(cfg))
 	// 续期后必须落盘：新 refresh_token 只在内存里，重启后账号就掉线了。
 	up.SetPersistHook(func(a *auth.Auth) error {
 		if err := a.SaveAtomic(); err != nil {
@@ -112,6 +113,19 @@ func main() {
 		log.Printf("已恢复 %d 个账号的池状态", restored)
 	}
 	p.SyncToDir(auths) // Restore 可能补了 uid，再对齐一次
+
+	// 打印每个账号的「来源 + 出口 IP」。
+	//
+	// 放在池就绪之后：出口是按账号算的，得先知道有哪些账号。这一步也是
+	// 验证「粘性真的生效」的唯一手段——如果 11 个号打出来只有 1-2 个出口，
+	// 说明代理用户名没带上账号，分散等于没做。
+	if up.ProxyEnabled() {
+		probeCtx, cancelProbe := context.WithTimeout(context.Background(), 90*time.Second)
+		go func() {
+			defer cancelProbe()
+			up.LogProxyEgress(probeCtx, p.UIDs())
+		}()
+	}
 
 	flushCtx, stopFlush := context.WithCancel(context.Background())
 	defer stopFlush()
@@ -317,6 +331,7 @@ func applyHotConfig(c *Config, live *livecfg.Holder, p *pool.Pool, up *upstream.
 		pc.IdleWeightMax = c.Pool.IdleWeightMax
 	})
 	up.SetIdentity(c.Upstream.UserAgent, c.Upstream.ClientVersion)
+	up.SetProxy(proxyConfigOf(c))
 	// 调度参数也热更新：以前这里完全不碰 scheduler，面板上改签到时点/并发/
 	// 余额周期全部「保存成功但不生效」，要重启才看得出效果——用户以为配置坏了。
 	if sch != nil {
@@ -343,6 +358,22 @@ func applyHotConfig(c *Config, live *livecfg.Holder, p *pool.Pool, up *upstream.
 		})
 	}
 	log.Printf("配置已热更新：密钥=%s 策略=%s 软冷却=%s", maskKey(c.APIKey), strategy, c.Cooldown.SoftRate)
+}
+
+// proxyConfigOf 把配置映射成上游客户端的代理参数。
+//
+// 单独一个函数是为了让「启动装配」和「热更新」用同一份映射：两边各写一遍
+// 字段必然漂移，而漂移的表现是「改了配置重启才生效」——正是刚修过的坑。
+func proxyConfigOf(c *Config) upstream.ProxyConfig {
+	p := c.Upstream.Proxy
+	return upstream.ProxyConfig{
+		Enabled:        p.Enabled,
+		Template:       p.Template,
+		DialTimeout:    time.Duration(p.DialTimeoutSeconds) * time.Second,
+		EgressCheckURL: p.EgressCheckURL,
+		EgressTTL:      time.Duration(p.EgressTTLMinutes) * time.Minute,
+		Scope:          p.Scope,
+	}
 }
 
 // imageDirOf 决定图片落盘目录：配置优先，否则放在 state 文件旁边的 images/。

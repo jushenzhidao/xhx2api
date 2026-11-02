@@ -1004,6 +1004,11 @@
         { path: "upstream.auth_base", label: "认证基址", restart: true, hint: "空 = 官方" },
         { path: "upstream.points_base", label: "积分基址", restart: true, hint: "空 = 官方" },
         { path: "upstream.origin", label: "站点 Origin", restart: true, hint: "空 = 官方" },
+        { path: "upstream.proxy.enabled", label: "按账号走代理", type: "bool", hint: "每个账号固定一个出口，避免同 IP 批量查积分被风控" },
+        { path: "upstream.proxy.template", label: "代理模板", wide: true, hint: "socks5h://user-{account}:pass@host:port；{account} 换成 uid" },
+        { path: "upstream.proxy.scope", label: "代理作用域", hint: "points = 只积分域走代理（推荐）；all = 全部走" },
+        { path: "upstream.proxy.egress_ttl_minutes", label: "出口 IP 缓存（分钟）", type: "number" },
+        { path: "upstream.proxy.egress_check_url", label: "出口探测地址", hint: "空 = 内置兜底列表" },
       ],
     },
     {

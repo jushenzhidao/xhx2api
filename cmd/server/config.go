@@ -55,6 +55,30 @@ type Config struct {
 		ClientVersion string `json:"client_version"`
 		// CatalogCacheFile 模型目录持久化缓存（上游不可达时兜底）。
 		CatalogCacheFile string `json:"catalog_cache_file"`
+
+		// Proxy 是「按账号粘性出口」的 SOCKS5 代理。
+		//
+		// 为什么需要：上游对「同一出口 IP 并发查多个账号积分」很敏感。
+		// 2026-11-02 实测 ai-prod 一次性跑 11 个号签到后，/api/web/points/
+		// 整个前缀开始 403（空 body + X-TT-System-Error: 3），同 token 在
+		// 别处 200 —— 封的是 IP，不是凭证。按账号分出口后，识别面回落到
+		// 单账号，一次封禁也只影响那一个。
+		Proxy struct {
+			Enabled bool `json:"enabled"`
+			// Template 形如 socks5h://user-{account}:pass@host:port。
+			// {account} 替换成 uid ⇒ 同一账号恒定同一出口。
+			Template string `json:"template"`
+			// DialTimeoutSeconds 建连 + SOCKS5 握手上限。
+			DialTimeoutSeconds int `json:"dial_timeout_seconds"`
+			// EgressCheckURL 查出口 IP 的地址（空 = 内置兜底列表）。
+			EgressCheckURL string `json:"egress_check_url"`
+			// EgressTTLMinutes 出口 IP 缓存时长（出口按账号恒定，不用频查）。
+			EgressTTLMinutes int `json:"egress_ttl_minutes"`
+			// Scope 作用域：points（默认，只让积分域走代理）/ all。
+			// 默认 points 是因为代理供应商往往只开通部分用户名：
+			// 全局启用会让其余账号的聊天也一起断，而聊天本来直连是好的。
+			Scope string `json:"scope"`
+		} `json:"proxy"`
 	} `json:"upstream"`
 
 	Cooldown struct {
@@ -287,6 +311,9 @@ func defaults() *Config {
 	// 首字 p90 已到 284s），120s 的等响应头窗口会把本来能成的请求判成 504。
 	c.Upstream.HeaderTimeoutSeconds = 180
 	c.Upstream.IdleTimeoutSeconds = 300
+	// 代理默认关闭：直连是原有行为，打开与否必须显式决定。
+	c.Upstream.Proxy.DialTimeoutSeconds = 10
+	c.Upstream.Proxy.EgressTTLMinutes = 30
 	c.Upstream.CatalogCacheFile = "./data/model_catalog.json"
 	c.Cooldown.PlanCredit = "12h"
 	c.Cooldown.SoftRate = "60s"
@@ -443,6 +470,15 @@ func applyDefaults(c *Config) {
 	}
 	if c.Upstream.CatalogCacheFile == "" {
 		c.Upstream.CatalogCacheFile = d.Upstream.CatalogCacheFile
+	}
+	if c.Upstream.Proxy.DialTimeoutSeconds <= 0 {
+		c.Upstream.Proxy.DialTimeoutSeconds = 10
+	}
+	if c.Upstream.Proxy.EgressTTLMinutes <= 0 {
+		c.Upstream.Proxy.EgressTTLMinutes = 30
+	}
+	if strings.TrimSpace(c.Upstream.Proxy.Scope) == "" {
+		c.Upstream.Proxy.Scope = "points"
 	}
 	if c.Cooldown.PlanCredit == "" {
 		c.Cooldown.PlanCredit = d.Cooldown.PlanCredit

@@ -85,7 +85,7 @@ func (q *QrLogin) setStatus(raw string) {
 // 而把未知状态当 success 会拿到空票据卡死，当 canceled 会无故刷新用户正在扫的码。
 // success 但缺 access_token 同样按未完成处理（上游偶发只回状态不回票）。
 func (q *QrLogin) Poll(ctx context.Context) (*auth.Auth, bool, error) {
-	resp, err := q.client.doJSON(ctx, http.MethodPost, q.client.authBase()+QrCodePath,
+	resp, err := q.client.doJSON(ctx, nil, http.MethodPost, q.client.authBase()+QrCodePath,
 		map[string]string{"qrcode_code": q.code}, q.client.clientIDHeaders())
 	if err != nil {
 		return nil, false, nil

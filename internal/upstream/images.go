@@ -254,6 +254,7 @@ func (c *Client) EditImage(ctx context.Context, a *auth.Auth, body []byte, conte
 
 // postImage 是生图与改图共用的发送段（只有路径和 Content-Type 不同）。
 func (c *Client) postImage(ctx context.Context, a *auth.Auth, path string, body []byte, contentType, turnTitle string) (*ImageReply, error) {
+	ctx = withAccount(ctx, a.UID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.llmBase()+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, &Error{Kind: ErrServer, Status: 500, Msg: "构造小浣熊生图请求失败"}
@@ -271,7 +272,7 @@ func (c *Client) postImage(ctx context.Context, a *auth.Auth, path string, body 
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, err := c.imageClient().Do(req)
+	resp, err := c.clientFor(ctx, kindImage, req.URL.String()).Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, &Error{Kind: ErrClient, Status: 499, Msg: "客户端已断开"}

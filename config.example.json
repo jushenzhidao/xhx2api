@@ -28,7 +28,15 @@
     "idle_timeout_seconds": 300,
     "user_agent": "",
     "client_version": "",
-    "catalog_cache_file": "./data/model_catalog.json"
+    "catalog_cache_file": "./data/model_catalog.json",
+    "proxy": {
+      "enabled": false,
+      "template": "socks5h://poolclient-{account}:<password>@pool.livetest.cn:2090",
+      "scope": "points",
+      "dial_timeout_seconds": 10,
+      "egress_check_url": "",
+      "egress_ttl_minutes": 30
+    }
   },
   "cooldown": {
     "plan_credit": "12h",
@@ -48,8 +56,12 @@
     "idle_weight_max": 5
   },
   "schedule": {
-    "checkin_hours": [9],
-    "keepalive_hours": [3],
+    "checkin_hours": [
+      9
+    ],
+    "keepalive_hours": [
+      3
+    ],
     "checkin_enabled": true,
     "keepalive_enabled": true,
     "balance_refresh_enabled": true,
@@ -84,7 +96,6 @@
   "import": {
     "client_dirs": []
   },
-
   "login": {
     "enabled": true,
     "app_name": "办公小浣熊客户端",
@@ -110,9 +121,15 @@
       "public_read": true,
       "signed_ttl_seconds": 0
     },
-    "aliases": ["gpt-image-1", "gpt-image-1-mini", "gpt-image-2", "gpt-image-2.5", "dall-e-2", "dall-e-3"]
+    "aliases": [
+      "gpt-image-1",
+      "gpt-image-1-mini",
+      "gpt-image-2",
+      "gpt-image-2.5",
+      "dall-e-2",
+      "dall-e-3"
+    ]
   },
-
   "models": {
     "hidden": [],
     "include_upstream_hidden": true

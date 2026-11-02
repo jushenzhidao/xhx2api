@@ -74,7 +74,7 @@ type CreditPackage struct {
 
 // FetchQuota 返回原始额度节点（面板排障用）。
 func (c *Client) FetchQuota(ctx context.Context, a *auth.Auth) (map[string]any, error) {
-	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BalancePath, nil, c.authHeader(a))
+	resp, err := c.doJSON(ctx, a, http.MethodGet, c.pointsBase()+BalancePath, nil, c.authHeader(a))
 	if err != nil {
 		return nil, err
 	}
@@ -152,7 +152,7 @@ func (c *Client) BalancePackages(ctx context.Context, a *auth.Auth) ([]CreditPac
 // 用 income 口径：每日积分有效期 7 天，而 type=all 的窗口对重度账号只有 1~2 天，
 // 会把 5 天后才到期的那批整个漏掉，报出比实际更晚的到期时间。
 func (c *Client) dailyBatchExpiry(ctx context.Context, a *auth.Auth) int64 {
-	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
+	resp, err := c.doJSON(ctx, a, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
 	if err != nil {
 		return 0
 	}
@@ -200,7 +200,7 @@ func (c *Client) UserEntUsageDetailWithExpiry(ctx context.Context, a *auth.Auth)
 // 只报时刻不够：账号余额里往往混着不会过期的奖励/充值积分，面板若拿可用总额
 // 去算「哪天会作废多少」，会得出「6490 分 5 天后全没」这种吓人的假数。
 func (c *Client) earliestBatchExpiry(ctx context.Context, a *auth.Auth) (expire, points int64) {
-	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
+	resp, err := c.doJSON(ctx, a, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
 	if err != nil {
 		return 0, 0
 	}
@@ -288,7 +288,7 @@ func (c *Client) CheckinStatus(ctx context.Context, a *auth.Auth) (checkedIn boo
 // 只有 reward_grant（注册礼包/桌面端登录奖励），daily_points 恒为 0。这种号
 // claim 再多轮也不会有 daily_grant，报「签到失败」是谎报。
 func (c *Client) DailyGrant(ctx context.Context, a *auth.Auth) (today, ever bool, err error) {
-	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
+	resp, err := c.doJSON(ctx, a, http.MethodGet, c.pointsBase()+BillsPath+"?"+BillsIncomeQuery, nil, c.authHeader(a))
 	if err != nil {
 		return false, false, err
 	}
@@ -317,7 +317,7 @@ func (c *Client) DailyGrant(ctx context.Context, a *auth.Auth) (today, ever bool
 // 只有 granted=true 才记本地台账——发放本体是服务端 00:00 做的，这里只是
 // 兜住「登录弹窗式手动领取」那条路径。
 func (c *Client) CheckinClaim(ctx context.Context, a *auth.Auth) (bool, error) {
-	resp, err := c.doJSON(ctx, http.MethodPost, c.desktopBase()+"/login/points/grant", map[string]any{}, c.authHeader(a))
+	resp, err := c.doJSON(ctx, a, http.MethodPost, c.desktopBase()+"/login/points/grant", map[string]any{}, c.authHeader(a))
 	if err != nil {
 		return false, err
 	}
@@ -342,7 +342,7 @@ func (c *Client) ClaimMobileGrant(ctx context.Context, a *auth.Auth) (bool, erro
 	// APK 逆向：平台值是 Capacitor getPlatform() 加 app- 前缀，版本头带 v。
 	h["x-client-platform"] = "app-android"
 	h["x-client-version"] = "v1.0.3"
-	resp, err := c.doJSON(ctx, http.MethodPost, c.originBase()+"/api/web/mobile/v1"+MobileGrantPath, map[string]any{}, h)
+	resp, err := c.doJSON(ctx, a, http.MethodPost, c.originBase()+"/api/web/mobile/v1"+MobileGrantPath, map[string]any{}, h)
 	if err != nil {
 		return false, err
 	}
@@ -372,7 +372,7 @@ func (c *Client) RecentBills(ctx context.Context, a *auth.Auth, limit int) ([]Bi
 		limit = 100
 	}
 	query := fmt.Sprintf("paging.limit=%d&type=all&paging.offset=0", limit)
-	resp, err := c.doJSON(ctx, http.MethodGet, c.pointsBase()+BillsPath+"?"+query, nil, c.authHeader(a))
+	resp, err := c.doJSON(ctx, a, http.MethodGet, c.pointsBase()+BillsPath+"?"+query, nil, c.authHeader(a))
 	if err != nil {
 		return nil, err
 	}
@@ -425,7 +425,7 @@ func (c *Client) UserProfile(ctx context.Context, a *auth.Auth) (UserProfile, er
 	if a == nil || a.JWT() == "" {
 		return prof, errors.New("账号缺少 access_token")
 	}
-	resp, err := c.doJSON(ctx, http.MethodGet, c.authBase()+UserInfoPath, nil,
+	resp, err := c.doJSON(ctx, a, http.MethodGet, c.authBase()+UserInfoPath, nil,
 		map[string]string{"Accept": "application/json", "Authorization": "Bearer " + a.JWT()})
 	if err != nil {
 		return prof, err
@@ -530,7 +530,7 @@ func (c *Client) PrepareAccount(ctx context.Context, payload map[string]any) (*a
 
 // exchangeCode 用一次性授权码换凭证。
 func (c *Client) exchangeCode(ctx context.Context, code string) (*auth.Auth, error) {
-	resp, err := c.doJSON(ctx, http.MethodPost, c.authBase()+LoginCodePath,
+	resp, err := c.doJSON(ctx, nil, http.MethodPost, c.authBase()+LoginCodePath,
 		map[string]string{"authorization_code": code}, c.clientIDHeaders())
 	if err != nil {
 		return nil, err

@@ -298,7 +298,7 @@ func (c *Client) ConfirmIAM(ctx context.Context, token string) error {
 	if token == "" {
 		return &Error{Kind: ErrClient, Status: 400, Msg: "token 为空"}
 	}
-	resp, err := c.doJSON(ctx, http.MethodPost, c.authBase()+IamConfirmPath, map[string]any{},
+	resp, err := c.doJSON(ctx, nil, http.MethodPost, c.authBase()+IamConfirmPath, map[string]any{},
 		map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token})
 	if err != nil {
 		return err
@@ -365,7 +365,7 @@ func (c *Client) FetchProfile(ctx context.Context, token string) (*Profile, erro
 	if token == "" {
 		return nil, &Error{Kind: ErrClient, Status: 400, Msg: "token 为空"}
 	}
-	resp, err := c.doJSON(ctx, http.MethodGet, c.authBase()+UserInfoPath, nil, map[string]string{
+	resp, err := c.doJSON(ctx, nil, http.MethodGet, c.authBase()+UserInfoPath, nil, map[string]string{
 		"Accept":        "application/json",
 		"Authorization": "Bearer " + token,
 	})
@@ -407,7 +407,7 @@ func (c *Client) iamCall(ctx context.Context, path string, body any, action stri
 	if origin == "" {
 		origin = Origin
 	}
-	resp, err := c.doJSON(ctx, http.MethodPost, strings.TrimRight(origin, "/")+IamBase+path, body,
+	resp, err := c.doJSON(ctx, nil, http.MethodPost, strings.TrimRight(origin, "/")+IamBase+path, body,
 		map[string]string{"Accept": "application/json"})
 	if err != nil {
 		return nil, err
@@ -481,7 +481,7 @@ func isEndpointMissing(err error) bool {
 // 「upstream client (http 400)」，用户不知道该重过验证码还是该重填手机号。
 // 这里先解信封里的 code，再退回状态码。
 func (c *Client) smsCall(ctx context.Context, path string, body any, action string) (map[string]any, error) {
-	resp, err := c.doJSON(ctx, http.MethodPost, c.authBase()+path, body, c.authHeaders(nil))
+	resp, err := c.doJSON(ctx, nil, http.MethodPost, c.authBase()+path, body, c.authHeaders(nil))
 	if err != nil {
 		return nil, err
 	}
