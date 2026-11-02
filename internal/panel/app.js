@@ -1853,6 +1853,9 @@
         phone,
         captcha_param: captchaParam,
         inviter_user_id: ($("#sms-inviter").value || "").trim(),
+        // 默认 desktop：只有这条通道会创建可信设备，IAM 不建，
+        // 而 unbound 的号永远拿不到每日积分。
+        login_via: (($("#sms-channel") && $("#sms-channel").value) || "desktop"),
       },
     });
     // IAM 通道发码会返回 verification_id，登录时必须带回去。
@@ -1889,6 +1892,7 @@
           phone, code,
           verification_id: state.sms.verificationID || "",
           inviter_user_id: ($("#sms-inviter").value || "").trim(),
+          login_via: (($("#sms-channel") && $("#sms-channel").value) || "desktop"),
         },
       });
       toast(`${r.updated ? "已更新" : "已导入"} ${r.account.nickname || r.account.uid}`, "ok");

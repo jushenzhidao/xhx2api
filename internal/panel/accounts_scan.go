@@ -161,9 +161,16 @@ func (p *Panel) smsConfig(w http.ResponseWriter, r *http.Request) {
 // smsSend 发送登录验证码。captcha_param 由前端控件回调拿到后原样带上来。
 func (p *Panel) smsSend(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
-		Phone         string `json:"phone"`
-		NationCode    string `json:"nation_code"`
-		CaptchaParam  string `json:"captcha_param"`
+		Phone        string `json:"phone"`
+		NationCode   string `json:"nation_code"`
+		CaptchaParam string `json:"captcha_param"`
+		// LoginVia 登录通道："iam"（默认，网页通道）/ "desktop"（桌面端通道）。
+		//
+		// 为什么需要能选：IAM 通道的票**不建可信设备**，user_info 里
+		// trusted_device{bound:false, needs_bind:true}，这种号永远拿不到
+		// 每日积分（2026-11-03 实测 11 个号里 9 个如此）。桌面端通道才是
+		// 官方客户端走的那条，设备是在它的登录流程里建的。
+		LoginVia      string `json:"login_via"`
 		InviterUserID string `json:"inviter_user_id"`
 	}
 	if err := decodeJSON(r, &payload); err != nil {
@@ -174,7 +181,11 @@ func (p *Panel) smsSend(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	// 要记邀请归因时必须走桌面端通道，发码也得跟着走同一条，
 	// 否则验证码对不上（两条通道的码不通用）。
-	preferLegacy := strings.TrimSpace(payload.InviterUserID) != ""
+	//
+	// 用户显式要求 desktop 时同样走桌面端：那条通道是官方客户端的登录路径，
+	// 设备（trusted_device）在它的流程里创建；IAM 通道不建。
+	preferLegacy := strings.TrimSpace(payload.InviterUserID) != "" ||
+		strings.EqualFold(strings.TrimSpace(payload.LoginVia), "desktop")
 	res, err := p.cfg.Upstream.SendSmsCode(ctx, payload.NationCode, payload.Phone, payload.CaptchaParam, preferLegacy)
 	if err != nil {
 		writeErr(w, smsStatus(err), err.Error())
